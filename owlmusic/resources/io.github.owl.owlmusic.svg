@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4a86e8"/>
+      <stop offset="1" stop-color="#2a5fb4"/>
+    </linearGradient>
+    <linearGradient id="body" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e4ebf7"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="4" y="4" width="120" height="120" rx="28" ry="28" fill="url(#bg)"/>
+
+  <!-- 耳朵 -->
+  <path d="M34 40 L40 26 L52 36 Z" fill="url(#body)"/>
+  <path d="M94 40 L88 26 L76 36 Z" fill="url(#body)"/>
+
+  <!-- 头 -->
+  <path d="M64 32c-19 0-31 14-31 33 0 20 13 33 31 33s31-13 31-33c0-19-12-33-31-33z" fill="url(#body)" opacity="0.97"/>
+
+  <!-- 眼窝 -->
+  <circle cx="50" cy="63" r="15" fill="#1b2a41" opacity="0.92"/>
+  <circle cx="78" cy="63" r="15" fill="#1b2a41" opacity="0.92"/>
+  <circle cx="50" cy="63" r="10" fill="#ffffff"/>
+  <circle cx="78" cy="63" r="10" fill="#ffffff"/>
+  <circle cx="50" cy="65" r="5.6" fill="#1b2a41"/>
+  <circle cx="78" cy="65" r="5.6" fill="#1b2a41"/>
+  <circle cx="52.2" cy="62.4" r="1.9" fill="#ffffff"/>
+  <circle cx="80.2" cy="62.4" r="1.9" fill="#ffffff"/>
+
+  <!-- 喙 -->
+  <path d="M64 72 l5.4 9.4 h-10.8 z" fill="#f2a83b"/>
+
+  <!-- 音符点缀 -->
+  <g fill="#ffffff" opacity="0.9">
+    <ellipse cx="98" cy="96" rx="6.4" ry="4.8" transform="rotate(-18 98 96)"/>
+    <rect x="103.2" y="76" width="2.8" height="18" rx="1.4"/>
+    <path d="M103.2 76 q8 1.6 8 7.4" fill="none" stroke="#ffffff" stroke-width="2.8" stroke-linecap="round"/>
+  </g>
+</svg>
