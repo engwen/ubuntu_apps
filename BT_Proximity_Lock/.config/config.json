@@ -1,0 +1,18 @@
+{
+  "phone_mac": "8C:7A:3D:2D:26:FF",
+  "phone_name": "ICE 尊的Redmi K40",
+  "lock_delay_sec": 9,
+  "rssi_threshold": -50,
+  "disconnect_peripherals": false,
+  "disconnect_delay_sec": 5,
+  "peripheral_whitelist": [],
+  "scan_interval_sec": 3,
+  "auto_connect_device": true,
+  "auto_lock_enabled": true,
+  "auto_resume_on_reconnect": true,
+  "auto_unlock_on_reconnect": false,
+  "auto_start_on_boot": false,
+  "language": "zh-CN",
+  "window_width": 500,
+  "window_height": 900
+}

@@ -1,0 +1,28 @@
+[package]
+name = "bt-proximity-lock"
+version = "1.0.0"
+edition = "2021"
+description = "蓝牙远离自动锁屏 - Linux 蓝牙接近锁屏工具"
+license = "MIT"
+
+[[bin]]
+name = "bt-proximity-lock"
+path = "src/main.rs"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.9", features = ["v4_14"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = { version = "0.4", features = ["alloc"] }
+dirs = "6"
+# 系统托盘 StatusNotifierItem D-Bus 协议（单 worker 运行时）
+zbus = { version = "4", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+
+[profile.release]
+# 常驻后台程序优先控制体积与常驻内存，对其 IO 密集型工作负载无性能损失
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
