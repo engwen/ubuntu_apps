@@ -9,8 +9,32 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 pub const EXTENSIONS: &[&str] = &[
-    "mp3", "flac", "m4a", "mp4", "aac", "ogg", "opus", "wav", "aiff", "aif", "wv", "ape",
+    // 能解码 + 能读标签
+    "mp3", "mp2", "mp1", "flac", "m4a", "mp4", "m4b", "aac", "ogg", "oga", "opus", "wav", "aiff",
+    "aif", "aifc", "caf", "mka", // 能读标签，但解码器不支持（列在这里是为了还能改标签）
+    "wv", "ape", "dsf", "wma",
 ];
+
+/// 能解码播放的容器/编码（和 Cargo.toml 里 symphonia 的 feature 一一对应，
+/// 每一项都用 `owlmusic --probe` 实测过）。
+/// 不在这个表里的扩展名仍然会进曲库：标签能读写，只是点播放会明确提示不支持——
+/// 总比让用户看着一个点不动的条目、以为程序坏了要好。
+const DECODABLE: &[&str] = &[
+    "mp3", "flac", "m4a", "mp4", "m4b", "aac", "ogg", "oga", "wav", "aiff", "aif", "aifc", "caf",
+    "mka",
+];
+
+pub fn extension_of(path: &Path) -> String {
+    path.extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
+/// symphonia 能不能解码这个文件。注意 .opus 目前不行：
+/// symphonia 0.5 只带 vorbis 解码器，ogg 容器里的 opus 音轨会 probe 成功但解不出样本。
+pub fn can_decode(path: &Path) -> bool {
+    DECODABLE.contains(&extension_of(path).as_str())
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Track {
@@ -71,6 +95,8 @@ impl Track {
         }
         s
     }
+    /// 文件后缀（小写）。界面上不再展示，保留给检索/调试用。
+    #[allow(dead_code)]
     pub fn ext(&self) -> String {
         self.path
             .extension()
@@ -330,5 +356,25 @@ mod tests {
         assert_eq!(fmt_time(0), "0:00");
         assert_eq!(fmt_time(65_000), "1:05");
         assert_eq!(fmt_time(3_600_000), "60:00");
+    }
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn decode_whitelist_matches_shipped_features() {
+        // 实测能解的
+        for ok in ["a.MP3", "b.flac", "c.m4a", "d.ogg", "e.wav", "f.aiff", "g.caf", "h.mka"] {
+            assert!(can_decode(&PathBuf::from(ok)), "{ok} 应该能播");
+        }
+        // opus 缺解码器、ape/wv 没有实现、dsf 是 DSD：能入库但不能播
+        for no in ["i.opus", "j.ape", "k.wv", "l.dsf", "m.wma"] {
+            assert!(!can_decode(&PathBuf::from(no)), "{no} 不该标记为可播");
+        }
+        // 没有扩展名不能崩
+        assert!(!can_decode(&PathBuf::from("noext")));
     }
 }

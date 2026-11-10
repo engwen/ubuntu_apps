@@ -56,3 +56,40 @@ pub fn cover_to_temp(cover: &Cover, name: &str) -> Option<std::path::PathBuf> {
     std::fs::write(&p, &cover.data).ok()?;
     Some(p)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// 「选中歌词 → 写进源文件」靠的就是这个：写完必须读得回来。
+    /// 拿真实样本跑（没有样本就跳过），MP3 走 ID3v2 的 USLT，FLAC 走 Vorbis 的 LYRICS。
+    fn roundtrip(sample: &str, dst_name: &str) {
+        let raw = Path::new("target/testmusic").join(sample);
+        if !raw.exists() {
+            return;
+        }
+        let dst = std::env::temp_dir().join(format!(
+            "owl-lyr-tag-{}-{dst_name}",
+            std::process::id()
+        ));
+        std::fs::copy(&raw, &dst).unwrap();
+
+        let text = "[00:01.00]第一行\n[00:05.00]第二行";
+        write_lyrics(&dst, text).expect("写入歌词");
+        let got = read_lyrics(&dst).expect("写完应该读得到歌词");
+        assert!(got.contains("第一行"), "{sample} 读回：{got}");
+        assert!(got.contains("第二行"), "{sample} 读回：{got}");
+        std::fs::remove_file(&dst).ok();
+    }
+
+    #[test]
+    fn lyrics_roundtrip_in_mp3() {
+        roundtrip("某人 - MP3 测试.mp3", "a.mp3");
+    }
+
+    #[test]
+    fn lyrics_roundtrip_in_flac() {
+        roundtrip("周杰伦 - 晴天.flac", "a.flac");
+    }
+}

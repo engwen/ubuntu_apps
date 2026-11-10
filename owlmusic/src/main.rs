@@ -1,8 +1,12 @@
 mod alsa;
 mod config;
+mod desktop;
+mod guard;
 mod library;
 mod lrc;
+mod lyrics;
 mod meta;
+mod mpris;
 mod online;
 mod player;
 mod tags;
@@ -13,33 +17,78 @@ use gtk::prelude::*;
 fn main() {
     // 无界面自检：owlmusic --selftest [--dir 音乐目录]
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // 诊断单个文件能不能解码：owlmusic --probe 某首歌.flac
+    if let Some(i) = args.iter().position(|a| a == "--probe") {
+        match args.get(i + 1) {
+            Some(f) => {
+                println!("{f}");
+                match player::probe_file(std::path::Path::new(f)) {
+                    Ok(s) => println!("  ✓ 可以播放：{s}"),
+                    Err(e) => println!("  ✗ 播不了：{e}"),
+                }
+            }
+            None => println!("用法：owlmusic --probe <音频文件>"),
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--selftest") {
         selftest(&args);
+        return;
+    }
+    // 无界面验证 MPRIS：注册服务、挂一首假歌、跑几秒主循环。
+    // 另开一个终端用 dbus-send / playerctl 就能查到它。
+    if args.iter().any(|a| a == "--mpris-selftest") {
+        let secs = args
+            .iter()
+            .position(|a| a == "--mpris-selftest")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(5);
+        mpris_selftest(secs);
         return;
     }
 
     // 让窗口出现在任务栏时带上应用名
     glib::set_application_name("OwlMusic");
+    // X11 下 WM_CLASS 取的是程序名（默认是二进制名 owlmusic），
+    // 和 desktop 里的 StartupWMClass 对不上，Dock 就会把它当成陌生程序，
+    // 名字退回那串 app id。这里对齐成同一个 id。
+    glib::set_prgname(Some(desktop::APP_ID));
+    // 开发时直接跑二进制，系统里没有 .desktop —— 补一份到用户目录，
+    // 好让 Dock 显示 OwlMusic 和图标；装过 deb 时这一步什么都不做。
+    if desktop::ensure_registered() {
+        guard::log("已补写用户级 desktop 条目");
+    }
+
+    // 崩了要留下证据：release 是 panic=abort，没有 hook 的话进程直接消失
+    guard::install_panic_hook();
+    // 上次没正常退出 -> 本次安全模式（关掉封面背景之类容易出事的重活）
+    let safe = guard::begin_run();
 
     let app = gtk::Application::builder()
-        .application_id("io.github.owl.owlmusic")
+        .application_id(desktop::APP_ID)
         .build();
 
-    app.connect_activate(|application| {
+    app.connect_activate(move |application| {
+        guard::log("activate");
         gtk::Window::set_default_icon_name("multimedia-audio-player");
         if let Some(existing) = application.active_window() {
+            // 走到这里说明是「再点一次图标」：把已有窗口提到前面就行
+            guard::log("已有窗口，present 后返回（没有新建实例）");
             existing.present();
             return;
         }
-        let state = ui::App::new(application);
+        let state = ui::App::new(application, safe);
         state.window.present();
     });
 
-    app.run();
+    let code = app.run();
+    // 能走到这里说明主循环结束了；如果日志里没有 activate，多半是被
+    // 另一个还没退出的实例接管了（GApplication 单实例），或者初始化就失败了
+    guard::log(&format!("主循环退出 code={}", i32::from(code)));
 }
 
 // ================= 无界面自检 =================
-// 不启动 GTK，用于在终端里确认解码器、标签、歌词、网络是否正常。
 fn selftest(args: &[String]) {
     println!("OwlMusic {} 自检", env!("CARGO_PKG_VERSION"));
     println!("  配置目录 : {}", config::config_dir().display());
@@ -108,5 +157,47 @@ fn selftest(args: &[String]) {
             }
         }
     }
+    println!("完成。");
+}
+
+// ================= MPRIS 自检 =================
+/// 注册 MPRIS 服务、挂一首假歌，然后跑几秒主循环。
+/// 期间另开终端执行
+///   `dbus-send --session --print-reply --dest=org.mpris.MediaPlayer2.owlmusic \
+///      /org/mpris/MediaPlayer2 org.freedesktop.DBus.Properties.GetAll \
+///      string:org.mpris.MediaPlayer2.Player`
+/// 或用 `playerctl -l` / `playerctl metadata` 就能看到它。
+fn mpris_selftest(secs: u64) {
+    use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8};
+    use std::sync::{Arc, Mutex};
+
+    println!("OwlMusic MPRIS 自检（{secs} 秒后退出）");
+    let shared = Arc::new(player::Shared {
+        pos_ms: AtomicU64::new(65_000),
+        dur_ms: AtomicU64::new(245_000),
+        state: AtomicU8::new(player::ST_PLAYING),
+        volume: AtomicU32::new(0.72f32.to_bits()),
+        finished: AtomicU64::new(0),
+        error: Mutex::new(None),
+    });
+    let Some(m) = mpris::Mpris::start(shared, 0.72) else {
+        println!("  ✗ 连不上 session bus：DBUS_SESSION_BUS_ADDRESS 没设置？");
+        std::process::exit(1);
+    };
+    m.set_track(
+        "自检曲目",
+        "自检艺人",
+        "自检专辑",
+        245_000,
+        std::path::Path::new("/tmp/selftest.mp3"),
+        None,
+    );
+    println!("  已注册 {}", mpris::BUS_NAME);
+    println!("  现在可以用 dbus-send / playerctl 查询；Ctrl-C 提前结束。");
+
+    let ml = glib::MainLoop::new(None, false);
+    let quit = ml.clone();
+    glib::timeout_add_seconds_local_once(secs as u32, move || quit.quit());
+    ml.run();
     println!("完成。");
 }

@@ -49,6 +49,8 @@ pub struct Config {
     pub repeat: u8,
     /// 歌单显示在窗口右侧
     pub sidebar_right: bool,
+    /// 歌单栏宽度（拖动分隔条后记住，切歌不重置）
+    pub sidebar_w: i32,
     /// 歌词页使用专辑封面做背景
     pub cover_bg: bool,
     /// 封面背景模糊强度 0.2–2.0
@@ -57,6 +59,12 @@ pub struct Config {
     pub lyric_bg_opacity: f32,
     /// 播放时若无歌词自动在线匹配
     pub auto_lyric: bool,
+    /// 歌词文件夹：内嵌标签没有歌词时先来这里找，在线匹配到的也能存进来
+    pub lyric_dir: Option<PathBuf>,
+    /// 在线匹配到歌词后自动存进歌词文件夹
+    pub lyric_auto_save: bool,
+    /// 手动选好歌词后写进音频文件的歌词标签（默认开，可关）
+    pub lyric_auto_tag: bool,
     /// 启动时接着上次的位置
     pub resume: bool,
     /// 上次播放进度（毫秒）
@@ -80,10 +88,14 @@ impl Default for Config {
             shuffle: false,
             repeat: 1,
             sidebar_right: false,
+            sidebar_w: 392,
             cover_bg: true,
             blur: 1.0,
             lyric_bg_opacity: 0.5,
             auto_lyric: false,
+            lyric_dir: None,
+            lyric_auto_save: true,
+            lyric_auto_tag: true,
             resume: true,
             last_pos_ms: 0,
             country: "jp".into(),
@@ -144,7 +156,16 @@ mod tests {
         assert_eq!(d.blur, c.blur);
         assert_eq!(d.lyric_bg_opacity, c.lyric_bg_opacity);
         assert_eq!(d.lyric.font_size, c.lyric.font_size);
+        assert_eq!(d.sidebar_w, c.sidebar_w);
         assert!(d.resume);
+        assert!(d.lyric_auto_tag);
+    }
+
+    #[test]
+    fn old_config_enables_auto_tag() {
+        // 老配置文件里没有这个字段，读出来应该是默认开（不影响老用户）
+        let d: Config = serde_json::from_str(r#"{"lyric_auto_save":false}"#).unwrap();
+        assert!(d.lyric_auto_tag);
     }
 
     #[test]

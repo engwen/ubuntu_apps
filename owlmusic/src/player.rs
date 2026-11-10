@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use symphonia::core::audio::{SampleBuffer, Signal};
+use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{Decoder as SymphoniaDecoder, DecoderOptions};
 use symphonia::core::errors::Error as SymError;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
@@ -23,6 +23,9 @@ pub const ST_PLAYING: u8 = 1;
 pub const ST_PAUSED: u8 = 2;
 
 const CHUNK_MS: u64 = 40;
+/// 淡入淡出时长（毫秒）。起播、暂停、继续都走这段斜坡，
+/// 避免「啪」的一下满音量出声 / 一刀切断。
+const FADE_MS: f32 = 320.0;
 
 pub struct Shared {
     pub pos_ms: AtomicU64,
@@ -156,7 +159,8 @@ fn engine(rx: Receiver<Cmd>, shared: Arc<Shared>) {
     let mut rate = 44_100u32;
     let mut channels = 2u16;
     let mut out: Vec<f32> = Vec::with_capacity(16_384);
-    let mut last_state = ST_STOPPED;
+    // 当前淡变增益 0..1：起播从 0 升到 1，暂停从 1 降到 0
+    let mut fade: f32 = 0.0;
 
     loop {
         // 命令处理
@@ -208,24 +212,25 @@ fn engine(rx: Receiver<Cmd>, shared: Arc<Shared>) {
                             dec = None;
                         }
                     }
-                    last_state = shared.state();
+                    // 换曲一律从静音开始淡入，哪怕文件打不开（下一首也一样）
+                    fade = 0.0;
                 }
                 Ok(Cmd::Play) => {
                     shared.state.store(ST_PLAYING, Ordering::Relaxed);
-                    last_state = ST_PLAYING;
                 }
                 Ok(Cmd::Pause) => {
+                    // 只改状态：引擎会在接下来的几块里把音量降到 0 再停，
+                    // 所以这里不能 flush，否则就成了硬切
                     shared.state.store(ST_PAUSED, Ordering::Relaxed);
-                    last_state = ST_PAUSED;
                 }
                 Ok(Cmd::Stop) => {
                     dec = None;
+                    fade = 0.0;
                     shared.state.store(ST_STOPPED, Ordering::Relaxed);
                     shared.pos_ms.store(0, Ordering::Relaxed);
                     if let Some(p) = &pcm {
                         p.flush();
                     }
-                    last_state = ST_STOPPED;
                 }
                 Ok(Cmd::Seek(ms)) => {
                     if let Some(d) = dec.as_mut() {
@@ -252,9 +257,19 @@ fn engine(rx: Receiver<Cmd>, shared: Arc<Shared>) {
         }
 
         let state = shared.state();
-        last_state = state;
 
-        if state != ST_PLAYING || dec.is_none() {
+        if dec.is_none() {
+            fade = 0.0;
+            thread::sleep(Duration::from_millis(12));
+            continue;
+        }
+
+        // 播放态目标满音量，暂停/停止目标静音。
+        // 关键点：淡出期间还要继续解码并写出逐渐变小的声音，
+        // 直接停下来的话，ALSA 里已经缓冲的那一块会被硬切。
+        let target = if state == ST_PLAYING { 1.0 } else { 0.0 };
+        if state != ST_PLAYING && fade <= 0.0005 {
+            fade = 0.0;
             thread::sleep(Duration::from_millis(12));
             continue;
         }
@@ -279,12 +294,22 @@ fn engine(rx: Receiver<Cmd>, shared: Arc<Shared>) {
                 let vol = shared.volume();
                 let gain = vol * vol; // 平方律，接近听感线性
                 let ch = channels as usize;
+                let played_frames = (out.len() / ch.max(1)) as u64;
+
+                // 按这一块的真实时长推进增益：320ms 的淡变在 40ms 一块时约 8 块走完
+                let chunk_ms = played_frames as f32 * 1000.0 / rate.max(1) as f32;
+                let next = fade_next(fade, target, chunk_ms);
+
+                // 块内做线性插值，块与块之间才不会出现台阶状的音量跳变
+                let n = out.len().max(1) as f32;
                 let mut buf: Vec<i16> = Vec::with_capacity(out.len());
-                for s in &out {
-                    let v = (s * gain * 32767.0).clamp(-32768.0, 32767.0);
+                for (i, s) in out.iter().enumerate() {
+                    let g = fade + (next - fade) * (i as f32 / n);
+                    let v = (s * gain * g * 32767.0).clamp(-32768.0, 32767.0);
                     buf.push(v as i16);
                 }
-                let played_frames = (out.len() / ch.max(1)) as u64;
+                fade = next;
+
                 if let Some(p) = &pcm {
                     if let Err(e) = p.write(&buf) {
                         if let Ok(mut g) = shared.error.lock() {
@@ -304,6 +329,7 @@ fn engine(rx: Receiver<Cmd>, shared: Arc<Shared>) {
             None => {
                 if dec.is_some() {
                     dec = None;
+                    fade = 0.0;
                     shared.state.store(ST_STOPPED, Ordering::Relaxed);
                     let done = shared.pos_ms.load(Ordering::Relaxed);
                     let total = shared.dur_ms.load(Ordering::Relaxed);
@@ -316,7 +342,6 @@ fn engine(rx: Receiver<Cmd>, shared: Arc<Shared>) {
                 thread::sleep(Duration::from_millis(10));
             }
         }
-        let _ = last_state;
     }
 }
 
@@ -440,7 +465,46 @@ impl Decoder {
         }
         Ok(false)
     }
+}
 
+/// 诊断用：打开文件、真的解一段出来，告诉用户是「容器认不出」还是「编码不支持」。
+/// `owlmusic --probe 某个文件` 会调它，排查「这首为什么播不了」时比看日志快。
+pub fn probe_file(path: &std::path::Path) -> Result<String, String> {
+    let mut d = Decoder::open(&path.to_path_buf())?;
+    let mut out = Vec::new();
+    let mut frames = 0usize;
+    let mut samples = 0usize;
+    for _ in 0..40 {
+        match d.read_into(&mut out)? {
+            true => {
+                frames += 1;
+                samples += out.len();
+            }
+            false => break,
+        }
+    }
+    if frames == 0 {
+        return Err("解不出任何音频数据".into());
+    }
+    let ms = samples as f64 / (d.rate as f64 * d.channels as f64) * 1000.0;
+    Ok(format!(
+        "{} Hz · {} 声道 · 共解出 {} 帧 / {:.0} ms 音频",
+        d.rate, d.channels, frames, ms
+    ))
+}
+
+
+/// 淡变增益的下一步：按这一块的真实时长朝目标走一格。
+///
+/// 抽成纯函数是为了能单测——引擎里那段真实时间是 40ms 一块，
+/// 想验证「320ms 内到满音量」「不会过冲」只能靠算，不能靠听。
+fn fade_next(cur: f32, target: f32, chunk_ms: f32) -> f32 {
+    let step = (chunk_ms / FADE_MS).clamp(0.0, 1.0);
+    if cur < target {
+        (cur + step).min(target)
+    } else {
+        (cur - step).max(target)
+    }
 }
 
 /// 预留给以后做播放队列的环形缓冲
@@ -454,4 +518,49 @@ struct Ring {
 fn frames_to_ms(frames: u64, tb: TimeBase) -> u64 {
     let t = tb.calc_time(frames);
     t.seconds * 1000 + (t.frac * 1000.0) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 起播必须从静音爬满，而且 320ms 内正好到 1.0：不能一出声就是满音量。
+    #[test]
+    fn fade_in_reaches_full_in_one_fade_window() {
+        let mut g = 0.0f32;
+        let mut ms = 0.0f32;
+        while g < 1.0 && ms < 2000.0 {
+            let next = fade_next(g, 1.0, CHUNK_MS as f32);
+            assert!(next >= g, "淡入不能回头");
+            g = next;
+            ms += CHUNK_MS as f32;
+        }
+        assert_eq!(g, 1.0);
+        assert!(ms <= FADE_MS + CHUNK_MS as f32, "淡入用时应约等于 FADE_MS，实际 {ms}ms");
+    }
+
+    /// 暂停时同理：降到 0 就停住，不会负数、也不会过冲。
+    #[test]
+    fn fade_out_settles_at_zero() {
+        let mut g = 1.0f32;
+        for _ in 0..40 {
+            g = fade_next(g, 0.0, CHUNK_MS as f32);
+        }
+        assert_eq!(g, 0.0);
+    }
+
+    /// 暂停到一半又点了播放：增益要从当前位置往回爬，不能跳变也不越过 1。
+    #[test]
+    fn fade_reverses_midway() {
+        let mut g = 0.0f32;
+        for _ in 0..4 {
+            g = fade_next(g, 1.0, CHUNK_MS as f32);
+        }
+        let mid = g;
+        assert!(mid > 0.0 && mid < 1.0);
+        g = fade_next(g, 0.0, CHUNK_MS as f32);
+        assert!(g < mid && g >= 0.0);
+        g = fade_next(g, 1.0, CHUNK_MS as f32);
+        assert!(g > 0.0 && g <= 1.0);
+    }
 }

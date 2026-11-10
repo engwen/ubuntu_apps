@@ -5,6 +5,61 @@ pub struct Line {
     pub time: u64,
     pub text: String,
     pub trans: Option<String>,
+    /// 词级时间轴（增强型 LRC 的 `<mm:ss.xx>`）：
+    /// (时间, 该标签之后 `text` 里的字节偏移)。空表示只有行级时间。
+    pub words: Vec<(u64, usize)>,
+}
+
+impl Line {
+    /// 这一行唱到 `ms` 时应该填到第几个字节（用于卡拉OK逐字上色）。
+    ///
+    /// - 有词级标签：在相邻两个标签之间按时间插值，唱到哪填到哪；
+    /// - 只有行级时间：在 `[time, end)` 之间线性推进整行。
+    ///
+    /// 返回的偏移一定落在 UTF-8 字符边界上（否则 Pango 会整行不渲染）。
+    pub fn sung_cut(&self, ms: u64, end: u64) -> usize {
+        let len = self.text.len();
+        if len == 0 {
+            return 0;
+        }
+        if !self.words.is_empty() {
+            if ms < self.words[0].0 {
+                return 0;
+            }
+            let k = self.words.partition_point(|(t, _)| *t <= ms) - 1;
+            let (t0, o0) = self.words[k];
+            let (t1, o1) = match self.words.get(k + 1) {
+                Some(&(t, o)) => (t, o),
+                None => (end.max(t0 + 1), len),
+            };
+            let f = if t1 > t0 {
+                ((ms - t0) as f64 / (t1 - t0) as f64).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let cut = o0 as f64 + (o1 as f64 - o0 as f64) * f;
+            return snap_char(&self.text, cut as usize);
+        }
+        if ms <= self.time || end <= self.time {
+            return 0;
+        }
+        if ms >= end {
+            return len;
+        }
+        let f = (ms - self.time) as f64 / (end - self.time) as f64;
+        snap_char(&self.text, (len as f64 * f) as usize)
+    }
+}
+
+/// 向下取到合法字符边界，避免把多字节字符切成两半。
+fn snap_char(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 #[derive(Clone, Debug, Default)]
@@ -30,6 +85,14 @@ impl Lyrics {
             Some(0)
         } else {
             Some(idx - 1)
+        }
+    }
+
+    /// 第 `i` 行的结束时间：下一行的开始；最后一行按 +6s 兜底。
+    pub fn line_end(&self, i: usize) -> u64 {
+        match self.lines.get(i + 1) {
+            Some(n) => n.time.max(self.lines[i].time + 1),
+            None => self.lines[i].time + 6_000,
         }
     }
 
@@ -77,18 +140,45 @@ fn parse_tag(tag: &str) -> Option<Result<u64, i64>> {
     Some(Ok(m * 60_000 + s * 1000 + ms))
 }
 
-fn strip_word_tags(s: &str) -> String {
+/// 拆出增强型 LRC 的 `<mm:ss.xx>` 词级标签。
+///
+/// 返回去掉标签的正文，以及每个标签之后正文的字节偏移：
+/// `<00:01.00>Hel<00:01.50>lo` → ("Hello", [(1000, 0), (1500, 3)])。
+/// 这样正文和偏移一起产出，不会出现「先删标签再按字符数估算」导致的对不上。
+fn split_word_tags(s: &str) -> (String, Vec<(u64, usize)>) {
     let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for c in s.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(c),
-            _ => {}
+    let mut words: Vec<(u64, usize)> = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        let rest = &s[i..];
+        if let Some(after) = rest.strip_prefix('<') {
+            if let Some(close) = after.find('>') {
+                if let Some(Ok(ms)) = parse_tag(&after[..close]) {
+                    words.push((ms, out.len()));
+                    i += 1 + close + 1;
+                    continue;
+                }
+            }
         }
+        let c = rest.chars().next().unwrap();
+        out.push(c);
+        i += c.len_utf8();
     }
-    out
+    (out, words)
+}
+
+/// 去掉首尾空白，同时把词级偏移跟着平移（trim 会挪动字节位置）。
+fn trim_keep_offsets(s: &str, words: &mut Vec<(u64, usize)>) -> String {
+    let t = s.trim();
+    if t.is_empty() {
+        words.clear();
+        return String::new();
+    }
+    let lead = s.len() - s.trim_start().len();
+    for (_, off) in words.iter_mut() {
+        *off = off.saturating_sub(lead).min(t.len());
+    }
+    t.to_string()
 }
 
 pub fn parse(text: &str) -> Lyrics {
@@ -122,7 +212,8 @@ pub fn parse(text: &str) -> Lyrics {
                 }
             }
         }
-        let body = strip_word_tags(rest).trim().to_string();
+        let (raw_body, mut words) = split_word_tags(rest);
+        let body = trim_keep_offsets(&raw_body, &mut words);
         if stamps.is_empty() {
             if !body.is_empty() {
                 plain.push(body);
@@ -134,6 +225,7 @@ pub fn parse(text: &str) -> Lyrics {
                 time: ms,
                 text: body.clone(),
                 trans: None,
+                words: words.clone(),
             });
         }
     }
@@ -146,6 +238,7 @@ pub fn parse(text: &str) -> Lyrics {
                 time: 0,
                 text: t,
                 trans: None,
+                words: Vec::new(),
             })
             .collect();
         return Lyrics {
@@ -252,6 +345,49 @@ mod tests {
         assert!(out.contains("[00:05.50]abc"));
         let again = parse(&out);
         assert_eq!(again.lines[0].time, 5_500);
+    }
+
+    #[test]
+    fn parses_word_level_tags() {
+        let l = parse("[00:01.00]<00:01.00>你<00:01.50>好<00:02.00>啊\n[00:03.00]x\n");
+        let line = &l.lines[0];
+        assert_eq!(line.text, "你好啊");
+        assert_eq!(line.words, vec![(1000, 0), (1500, 3), (2000, 6)]);
+    }
+
+    #[test]
+    fn sung_cut_uses_word_tags_when_present() {
+        let l = parse("[00:01.00]<00:01.00>ab<00:02.00>cd\n[00:05.00]next\n");
+        let line = &l.lines[0];
+        let end = l.line_end(0);
+        assert_eq!(line.sung_cut(1_000, end), 0, "第一个词刚开始");
+        assert_eq!(line.sung_cut(1_500, end), 1, "两个词之间按时间连续推进");
+        assert_eq!(line.sung_cut(2_000, end), 2, "第二个词开始");
+        assert_eq!(line.sung_cut(5_000, end), 4, "最后一个词到行尾才唱满");
+    }
+
+    #[test]
+    fn sung_cut_falls_back_to_line_progress() {
+        let l = parse("[00:10.00]abcd\n[00:14.00]efgh\n");
+        let line = &l.lines[0];
+        let end = l.line_end(0);
+        assert_eq!(end, 14_000);
+        assert_eq!(line.sung_cut(9_000, end), 0);
+        assert_eq!(line.sung_cut(10_000, end), 0);
+        assert_eq!(line.sung_cut(12_000, end), 2);
+        assert_eq!(line.sung_cut(14_000, end), 4);
+    }
+
+    #[test]
+    fn sung_cut_never_splits_a_char() {
+        // 中文每字 3 字节，按比例算出来的偏移必须落回字符边界
+        let l = parse("[00:00.00]一二三四\n[00:04.00]next\n");
+        let line = &l.lines[0];
+        let end = l.line_end(0);
+        for ms in 0..=4_000 {
+            let cut = line.sung_cut(ms, end);
+            assert!(line.text.is_char_boundary(cut), "ms={ms} cut={cut}");
+        }
     }
 
     #[test]

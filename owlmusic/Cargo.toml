@@ -12,6 +12,8 @@ gio = "0.22"
 lofty = "0.25"
 symphonia = { version = "0.5", features = [
     "mp3",
+    "mp1",
+    "mp2",
     "flac",
     "ogg",
     "vorbis",
@@ -19,6 +21,9 @@ symphonia = { version = "0.5", features = [
     "isomp4",
     "alac",
     "wav",
+    "aiff",
+    "caf",
+    "mkv",
     "pcm",
     "adpcm",
 ] }

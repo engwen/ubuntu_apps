@@ -7,6 +7,7 @@ pub mod theme;
 use crate::config::Config;
 use crate::library::{self, Track};
 use crate::lrc::{self, Lyrics};
+use crate::lyrics;
 use crate::player::{self, Player, Shared};
 use crate::tags;
 use gtk::prelude::*;
@@ -32,8 +33,12 @@ pub const BAR_PAD_Y: i32 = 6;
 pub const BAR_CONTENT_H: i32 = BAR_H - BAR_PAD_Y * 2;
 /// 播放条封面边长
 const BAR_COVER: i32 = 52;
-/// 舞台大封面边长
-const STAGE_COVER: i32 = 168;
+/// 歌单栏可拖动的宽度范围
+const SIDEBAR_MIN: i32 = 240;
+/// 右侧歌词区至少保留的宽度
+const STAGE_MIN: i32 = 320;
+/// 手动滚动歌词后，隔多久自动回弹到当前行
+const LYRIC_RESUME_AFTER: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Default)]
 pub struct RowData {
@@ -42,12 +47,18 @@ pub struct RowData {
     pub sub: String,
     pub dur: String,
     pub playing: bool,
-    pub selected: bool,
 }
 
 pub struct App {
     pub window: gtk::ApplicationWindow,
     pub cfg: Rc<RefCell<Config>>,
+    /// 安全模式：上次启动异常退出时由 main 打开。
+    /// 只在本进程内生效，不写回配置——修好之后下次启动就恢复正常。
+    pub safe_mode: bool,
+    /// 待写入的强调色：调用点如果还持有 `cfg` 借用（`if let` 的条件借用会
+    /// 活到整段代码结束），当场 `borrow_mut()` 会 panic；panic 又发生在 GTK 的
+    /// 回调里无法 unwind，进程会直接中止或假死。这里先记下来，下一帧再写。
+    pub pending_accent: Rc<RefCell<Option<String>>>,
     pub player: Rc<Player>,
     pub shared: Arc<Shared>,
     pub provider: gtk::CssProvider,
@@ -78,21 +89,44 @@ pub struct App {
     pub status: gtk::Label,
     pub sidebar: gtk::Box,
     pub stage: gtk::Box,
-    pub body: gtk::Box,
+    /// 中间左右两栏的分隔容器（可拖动，宽度记在配置里）
+    pub body: gtk::Paned,
+    /// 程序自己在设分隔条位置时置位，避免把回读当成用户拖动
+    paned_self: Cell<bool>,
+    /// 分隔条位置的延迟落盘序号（拖动时合并写入）
+    paned_epoch: Cell<u32>,
 
     // 右侧
-    pub cover: gtk::Picture,
+    /// 歌词区里那层功能按钮（已经叠在歌词上，不再单独占一行）
+    pub lyric_tools: gtk::Box,
     /// 歌词区的模糊封面背景
     pub lyric_bg: gtk::Picture,
     /// 背景上的渐变遮罩
     pub lyric_scrim: gtk::Box,
-    pub np_title: gtk::Label,
-    pub np_artist: gtk::Label,
-    pub np_sub: gtk::Label,
     pub lyric_box: gtk::Box,
     pub lyric_scroll: gtk::ScrolledWindow,
     pub lyric_labels: RefCell<Vec<gtk::Label>>,
+    /// 标签下标 -> 歌词行下标。`hide_empty` 会跳过空行，两者不能按下标硬对。
+    pub lyric_line_of_label: RefCell<Vec<usize>>,
+    /// 当前行已经唱到第几个字节（卡拉OK填充）；只在变化时重设属性
+    pub lyric_filled: Cell<usize>,
     pub lyric_target: Cell<f64>,
+    /// 人手动滚动歌词的静默期截止时间：期间不回弹，松手 3 秒后才归位。
+    /// 用 Rc 是为了让每行歌词的点击回调也能共享同一个状态。
+    pub lyric_hold_until: Rc<Cell<Option<Instant>>>,
+    /// 程序自己写进滚动条的目标值，用来区分「人手滚的」和「代码滚的」
+    lyric_set_value: Cell<f64>,
+    /// 刚换歌词时给布局留的缓冲：这段时间里滚动值的变化是内容高度变了导致的钳位，
+    /// 不是人在滚，不能因此进入静默期
+    lyric_settle_until: Cell<Option<Instant>>,
+    /// 直接在歌词上按下拖拽时，按下瞬间的滚动值（跟着手指相对位移算新位置）
+    lyric_drag_from: Cell<f64>,
+    /// 这次拖拽到底动没动过：没动 = 单击跳转，动过 = 平移滚动
+    lyric_drag_moved: Cell<bool>,
+    /// 按下点（相对 lyric_box 的坐标），松手时用来找是哪一行被点了
+    lyric_drag_start: Cell<(f64, f64)>,
+    /// MPRIS 服务：把正在播放的歌暴露给桌面（GNOME 媒体控制 / 顶栏歌词插件）
+    pub mpris: Option<Rc<crate::mpris::Mpris>>,
 
     // 底部
     pub bar_title: gtk::Label,
@@ -107,18 +141,86 @@ pub struct App {
     pub vol_scale: gtk::Scale,
 }
 
+/// 歌词行的状态：唱过的、正在唱的（逐字填充）、还没唱的。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RowState {
+    Idle,
+    Sung,
+    Active,
+}
+
+/// 生成一行歌词的 Pango 属性表和控件不透明度。
+///
+/// 正在唱的那行是卡拉OK的核心：整行强调色，再按字节切成
+/// 「已唱」（实心）和「未唱」（压暗）两段，随播放进度逐字点亮。
+/// 用属性区间而不是重新拼 markup：正文里可能有 `&`、`<`，
+/// 拼 markup 既慢又要转义，还容易把整行吃没。
+fn lyric_attrs(
+    style: &crate::config::LyricStyle,
+    color: (u8, u8, u8),
+    accent: (u8, u8, u8),
+    state: RowState,
+    filled: usize,
+    len: usize,
+) -> (pango::AttrList, f64) {
+    let attrs = pango::AttrList::new();
+    // Pango 颜色是 0..=65535，配置里是 0..=255
+    let mk = |(r, g, b): (u8, u8, u8)| {
+        pango::AttrColor::new_foreground((r as u16) * 257, (g as u16) * 257, (b as u16) * 257)
+    };
+    // 当前行按用户设定的大小，其余行收一档：参考站那种「只有一句是主角」的层次，
+    // 比整块歌词一样大要清爽，也顺带让长句不那么容易折行。
+    let size = if state == RowState::Active {
+        style.font_size as f64
+    } else {
+        (style.font_size as f64 * 0.86).max(9.0)
+    };
+    attrs.insert(pango::AttrSize::new((size as i32) * pango::SCALE));
+
+    match state {
+        RowState::Active => {
+            attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
+            // 整行先给正文色（亮白），再把「唱过」的那段覆盖成强调色：
+            // 没唱的部分是清楚的，唱到哪儿强调色就漫到哪儿，像卡拉OK字幕。
+            let mut base = mk(color);
+            if len > 0 {
+                base.set_start_index(0);
+                base.set_end_index(len as u32);
+            }
+            attrs.insert(base);
+            let cut = filled.min(len);
+            if cut > 0 {
+                let mut sung = mk(accent);
+                sung.set_start_index(0);
+                sung.set_end_index(cut as u32);
+                attrs.insert(sung);
+            }
+            (attrs, 1.0)
+        }
+        RowState::Sung => {
+            attrs.insert(pango::AttrInt::new_weight(pango::Weight::Normal));
+            attrs.insert(mk(color));
+            // 唱过的行比还没唱的亮一点，回头看能看出进度
+            (attrs, (style.dim + 0.24).clamp(0.3, 0.8) as f64)
+        }
+        RowState::Idle => {
+            attrs.insert(pango::AttrInt::new_weight(pango::Weight::Normal));
+            attrs.insert(mk(color));
+            (attrs, style.dim.clamp(0.12, 1.0) as f64)
+        }
+    }
+}
+
 /// 把一行的状态写成 CSS 类。
 ///
 /// 类只能挂在行内这个 Box（`.track-row`）上：列表的 `row` 节点在当前 GTK 里
 /// 是内部控件，从 Rust 侧拿不到。所以主题里的选择器也必须以 `.track-row` 为根，
 /// 写成 `.tracklist > row.playing` 永远不命中——这正是切歌后列表毫无反应的原因。
 fn paint_row(row: &gtk::Box, data: &RowData) {
-    for (class, on) in [("playing", data.playing), ("sel", data.selected)] {
-        if on {
-            row.add_css_class(class);
-        } else {
-            row.remove_css_class(class);
-        }
+    if data.playing {
+        row.add_css_class("playing");
+    } else {
+        row.remove_css_class("playing");
     }
 }
 
@@ -162,10 +264,73 @@ fn lyric_scroll_target(view_h: f64, line_y: f64, line_h: f64, offset: f64) -> f6
     (line_y + line_h / 2.0 - view_h / 2.0 + offset).max(0.0)
 }
 
+/// 按住歌词拖动时，指针位移 `dy` 对应的滚动值。
+///
+/// 和拖滚动条是同一套手感：按下时记下 `from`，之后每一像素都跟着指针走。
+/// 指针往上拖（`dy < 0`）内容跟着上移，滚动值变大，所以是减。
+/// 返回值钳在 `[lower, max]` 里，拖到两端不会把滚动条拽出内容范围。
+fn lyric_drag_scroll(from: f64, dy: f64, lower: f64, max: f64) -> f64 {
+    (from - dy).clamp(lower, max.max(lower))
+}
+
+/// 把强调色写进配置，返回「是否需要重载样式表」。
+///
+/// 全应用改强调色只有这一条写路径。它必须容忍「调用点还持有 `cfg` 借用」的情况：
+/// `if let Some(x) = f(a.cfg.borrow().y) { ... }` 里那个临时借用在编译器看来
+/// 活到整段块结束，块内再把颜色写回去就是 `already borrowed` panic；而 GTK 回调
+/// 是 `extern "C"`，panic 无法 unwind，进程会当场中止或假死（表现就是点了
+/// 「跟随封面」整个系统卡住）。所以借用不到时不当场写，记进 `pending`，
+/// 由 tick 下一帧补上——绝不会 panic。
+fn write_accent(
+    cfg: &std::cell::RefCell<Config>,
+    pending: &std::cell::RefCell<Option<String>>,
+    hex: &str,
+) -> bool {
+    match cfg.try_borrow_mut() {
+        Ok(mut c) => {
+            // 写成功就把更早的待写入值作废，免得旧颜色回头盖掉新的
+            *pending.borrow_mut() = None;
+            if c.accent == hex {
+                return false; // 颜色没变：不必重载整张样式表
+            }
+            c.accent = hex.to_string();
+            true
+        }
+        Err(_) => {
+            *pending.borrow_mut() = Some(hex.to_string());
+            false
+        }
+    }
+}
+
+/// 分隔条位置 -> 歌单栏宽度。
+///
+/// 歌单在左时位置直接就是它的宽度；在右时位置是「歌词区宽度」，
+/// 得用总宽减一下。两个方向都要能互相换算，配置里只存一个宽度。
+fn sidebar_width(pos: i32, total: i32, right: bool) -> i32 {
+    if right {
+        total - pos
+    } else {
+        pos
+    }
+}
+
+/// 歌单栏宽度 -> 分隔条位置（带上下限，太窄的歌词区/歌单栏都会钳住）
+fn paned_position(width: i32, total: i32, right: bool) -> i32 {
+    if right {
+        let hi = (total - SIDEBAR_MIN).max(STAGE_MIN);
+        (total - width).clamp(STAGE_MIN, hi)
+    } else {
+        let hi = (total - STAGE_MIN).max(SIDEBAR_MIN);
+        width.clamp(SIDEBAR_MIN, hi)
+    }
+}
+
 impl App {
-    pub fn new(gtk_app: &gtk::Application) -> Rc<Self> {
+    pub fn new(gtk_app: &gtk::Application, safe_mode: bool) -> Rc<Self> {
+        crate::guard::log("App::new 开始");
         let cfg = Rc::new(RefCell::new(Config::load()));
-        let (vol, w, h, theme_name, accent, shuffle_on, repeat, bg_opacity) = {
+        let (vol, w, h, theme_name, accent, shuffle_on, repeat, bg_opacity, w_side) = {
             let c = cfg.borrow();
             (
                 c.volume,
@@ -176,6 +341,7 @@ impl App {
                 c.shuffle,
                 c.repeat,
                 c.lyric_bg_opacity,
+                c.sidebar_w,
             )
         };
         let dark = theme_name != "light";
@@ -230,7 +396,13 @@ impl App {
         title_txt.append(&app_sub);
         title_box.append(&logo);
         title_box.append(&title_txt);
-        header.set_title_widget(Some(&title_box));
+        // 跟常规桌面软件一样：软件标识靠最左，窗口按钮由系统管在右边。
+        // set_title_widget 会把它塞到中间，所以这里改用 pack_start。
+        header.pack_start(&title_box);
+        // 但中间不能留空：HeaderBar 默认会拿「窗口标题」当标题显示在正中，
+        // 而我们每换一首歌都会改窗口标题，正中就会出现一行跳来跳去的曲名。
+        let no_title = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        header.set_title_widget(Some(&no_title));
 
         let btn_add = icon_btn("folder-new-symbolic", "添加音乐文件夹");
         let btn_rescan = icon_btn("view-refresh-symbolic", "重新扫描曲库");
@@ -368,7 +540,6 @@ impl App {
                     return;
                 };
                 row.remove_css_class("playing");
-                row.remove_css_class("sel");
                 cells_unbind.borrow_mut().retain(|_, v| *v != row);
             });
         }
@@ -409,43 +580,17 @@ impl App {
 
         let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
         sidebar.add_css_class("sidebar");
-        sidebar.set_width_request(392);
+        // 只给最小宽度，实际宽度由分隔条决定（记在 config.sidebar_w）
+        sidebar.set_size_request(SIDEBAR_MIN, -1);
         sidebar.append(&head);
         sidebar.append(&search_wrap);
         sidebar.append(&list_scroll);
         sidebar.append(&status);
 
-        // ---------- 右侧舞台 ----------
-        // 封面用定尺纹理（见 art::square）：Picture 的 natural size 等于纹理尺寸，
-        // 不裁成 STAGE_COVER 的话，一张 1000px 的图会把整个信息头撑高。
-        let cover = gtk::Picture::new();
-        cover.set_content_fit(gtk::ContentFit::Cover);
-        cover.set_size_request(STAGE_COVER, STAGE_COVER);
-        let cover_frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        cover_frame.add_css_class("cover-frame");
-        cover_frame.set_size_request(STAGE_COVER, STAGE_COVER);
-        cover_frame.set_valign(gtk::Align::Center);
-        cover_frame.append(&cover);
-
-        let np_title = lbl("未在播放", "np-title");
-        np_title.set_ellipsize(pango::EllipsizeMode::End);
-        np_title.set_max_width_chars(26);
-        let np_artist = lbl("从左侧选一首歌开始", "np-artist");
-        np_artist.set_ellipsize(pango::EllipsizeMode::End);
-        let np_sub = lbl("", "np-sub");
-        np_sub.set_ellipsize(pango::EllipsizeMode::End);
-
-        let np_info = gtk::Box::new(gtk::Orientation::Vertical, 7);
-        np_info.set_valign(gtk::Align::Center);
-        np_info.set_hexpand(true);
-        np_info.append(&np_title);
-        np_info.append(&np_artist);
-        np_info.append(&np_sub);
-
-        let np_header = gtk::Box::new(gtk::Orientation::Horizontal, 22);
-        np_header.append(&cover_frame);
-        np_header.append(&np_info);
-
+        // ---------- 右侧：整栏都是歌词 ----------
+        // 用户的原话是「上顶 topbar、下顶播放栏，整个右边全是歌词」，
+        // 所以这里不再留封面 + 曲名信息头，只留一块铺满的歌词区。
+        // 曲名/艺人在底部播放条上已经有了。
         let lyric_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         lyric_box.set_valign(gtk::Align::Start);
         lyric_box.set_margin_top(28);
@@ -474,7 +619,7 @@ impl App {
 
         let lyric_area = gtk::Overlay::new();
         lyric_area.add_css_class("lyric-area");
-        lyric_area.set_overflow(gtk::Overflow::Hidden); // 让圆角真正裁掉背景
+        lyric_area.set_overflow(gtk::Overflow::Hidden);
         lyric_area.set_hexpand(true);
         lyric_area.set_vexpand(true);
         let area_fill = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -485,31 +630,44 @@ impl App {
         lyric_area.add_overlay(&lyric_scrim);
         lyric_area.add_overlay(&lyric_scroll);
 
-        let lyric_tools = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        lyric_tools.append(&lbl("歌词", "side-title"));
-        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        spacer.set_hexpand(true);
-        lyric_tools.append(&spacer);
+        // 在线搜词 / 写入标签 / 歌词样式：做成浮在歌词右上角的工具条，
+        // 不再单独占一行（那一行会把歌词往下推，破坏「整栏都是歌词」）。
+        let lyric_tools = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        lyric_tools.add_css_class("lyric-tools");
+        lyric_tools.set_halign(gtk::Align::End);
+        lyric_tools.set_valign(gtk::Align::Start);
+        lyric_tools.set_margin_top(10);
+        lyric_tools.set_margin_end(12);
         let btn_online_lyric = icon_btn("system-search-symbolic", "在线搜索歌词");
         let btn_save_lyric = icon_btn("document-save-symbolic", "把歌词写入文件标签");
         let btn_lyric_style = icon_btn("preferences-desktop-font-symbolic", "歌词样式");
         lyric_tools.append(&btn_online_lyric);
         lyric_tools.append(&btn_save_lyric);
         lyric_tools.append(&btn_lyric_style);
+        lyric_area.add_overlay(&lyric_tools);
 
-        let stage = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        let stage = gtk::Box::new(gtk::Orientation::Vertical, 0);
         stage.add_css_class("stage");
         stage.set_hexpand(true);
         stage.set_vexpand(true);
-        stage.append(&np_header);
-        stage.append(&lyric_tools);
+        // 歌词区也要有最小宽度，否则拖动分隔条能把它挤成一条缝
+        stage.set_size_request(STAGE_MIN, -1);
         stage.append(&lyric_area);
 
-        let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        // ---------- 中间两栏：可拖动分隔条 ----------
+        // 用 Paned 而不是定宽 Box：左右宽度由用户拖，位置写进 config，
+        // 切歌/刷新界面都不会重算，窗口加宽时也只有弹性那侧跟着变。
+        let body = gtk::Paned::new(gtk::Orientation::Horizontal);
+        body.set_wide_handle(false);
         body.set_hexpand(true);
         body.set_vexpand(true);
-        body.append(&sidebar);
-        body.append(&stage);
+        body.set_start_child(Some(&sidebar));
+        body.set_end_child(Some(&stage));
+        body.set_position(w_side);
+        body.set_resize_start_child(false);
+        body.set_resize_end_child(true);
+        body.set_shrink_start_child(false);
+        body.set_shrink_end_child(false);
 
         // ---------- 播放条（固定高度，不随封面/歌词变化） ----------
         let bar_cover = gtk::Picture::new();
@@ -606,7 +764,7 @@ impl App {
         vol_scale.set_size_request(96, -1);
         vol_scale.set_valign(gtk::Align::Center);
         vol_scale.set_value(vol as f64);
-        let btn_only_lyric = icon_btn("view-list-symbolic", "只看歌词");
+        let btn_only_lyric = icon_btn("view-list-symbolic", "显示 / 隐藏歌词");
         let bar_right = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         bar_right.set_valign(gtk::Align::Center);
         bar_right.append(&vol_img);
@@ -624,13 +782,24 @@ impl App {
         centerbox.set_end_widget(Some(&bar_right));
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        // 背景画在这层而不是窗口上：截图自查时能连底一起渲染出来
+        root.add_css_class("owl-root");
         root.append(&body);
         root.append(&centerbox);
         window.set_child(Some(&root));
 
+        // MPRIS 要在窗口建好前就把对象注册上去：GNOME 面板是监听总线增删播放器的，
+        // 晚一步注册它就得等下一次扫描。
+        let mpris = {
+            let vol = cfg.borrow().volume as f64;
+            crate::mpris::Mpris::start(shared.clone(), vol)
+        };
+
         let app = Rc::new(App {
             window: window.clone(),
             cfg: cfg.clone(),
+            safe_mode,
+            pending_accent: Rc::new(RefCell::new(None)),
             player: player.clone(),
             shared: shared.clone(),
             provider,
@@ -657,16 +826,24 @@ impl App {
             sidebar: sidebar.clone(),
             stage: stage.clone(),
             body: body.clone(),
-            cover: cover.clone(),
+            paned_self: Cell::new(false),
+            paned_epoch: Cell::new(0),
+            lyric_tools: lyric_tools.clone(),
             lyric_bg: lyric_bg.clone(),
             lyric_scrim: lyric_scrim.clone(),
-            np_title: np_title.clone(),
-            np_artist: np_artist.clone(),
-            np_sub: np_sub.clone(),
             lyric_box: lyric_box.clone(),
             lyric_scroll: lyric_scroll.clone(),
             lyric_labels: RefCell::new(Vec::new()),
+            lyric_line_of_label: RefCell::new(Vec::new()),
+            lyric_filled: Cell::new(usize::MAX),
             lyric_target: Cell::new(0.0),
+            lyric_hold_until: Rc::new(Cell::new(None)),
+            lyric_set_value: Cell::new(0.0),
+            lyric_settle_until: Cell::new(None),
+            lyric_drag_from: Cell::new(0.0),
+            lyric_drag_moved: Cell::new(false),
+            lyric_drag_start: Cell::new((0.0, 0.0)),
+            mpris,
             bar_title: bar_title.clone(),
             bar_artist: bar_artist.clone(),
             bar_cover: bar_cover.clone(),
@@ -680,6 +857,11 @@ impl App {
         });
 
         *app_slot.borrow_mut() = Some(app.clone());
+
+        // 歌词区的鼠标输入：按住拖动=平移滚动，轻点=跳到那一句
+        app.wire_lyric_input();
+        // 把外部控制（GNOME 面板 / 快捷键 / 顶栏插件）接到播放器上
+        app.wire_mpris();
 
         if !crate::alsa::available() {
             app.set_status("没有找到 libasound，播放会失败：请安装 libasound2");
@@ -708,6 +890,52 @@ impl App {
             app.search.clone().connect_search_changed(move |e| {
                 let q = e.text().to_string();
                 a.apply_filter(&q);
+            });
+        }
+        // 中间分隔条：拖动后把宽度记进配置（600ms 合并落盘），切歌不重置
+        {
+            let a = app.clone();
+            app.body.clone().connect_notify_local(Some("position"), move |_, _| {
+                if !a.on_paned_moved() {
+                    return;
+                }
+                let epoch = a.paned_epoch.get();
+                let a2 = a.clone();
+                glib::timeout_add_local_once(Duration::from_millis(600), move || {
+                    if a2.paned_epoch.get() == epoch {
+                        a2.cfg.borrow().save();
+                    }
+                });
+            });
+        }
+        // 建窗口时分隔条还没有真实宽度，等第一次分配后再摆一次
+        {
+            let a = app.clone();
+            glib::timeout_add_local_once(Duration::from_millis(120), move || a.apply_layout());
+        }
+        // 人手滚动歌词（拖滚动条 / 滚轮）时进入静默期：
+        // 滚动过程中不断续期，所以拖多久都不回弹；松手 3 秒后才回到当前行。
+        {
+            let a = app.clone();
+            let adj = app.lyric_scroll.vadjustment();
+            adj.connect_value_changed(move |adj| {
+                // 代码自己滚的（动画/换行归位）不算
+                if (adj.value() - a.lyric_set_value.get()).abs() < 0.5 {
+                    return;
+                }
+                if a.lyrics.borrow().is_empty() {
+                    return;
+                }
+                // 刚重建完歌词：这时的变化多半是内容变高/变矮引起的钳位
+                if a.lyric_settle_until
+                    .get()
+                    .map(|t| Instant::now() < t)
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                a.lyric_hold_until
+                    .set(Some(Instant::now() + LYRIC_RESUME_AFTER));
             });
         }
 
@@ -745,6 +973,9 @@ impl App {
                     c.volume = v as f32;
                     c.save();
                 }
+                if let Some(m) = &a.mpris {
+                    m.set_volume(v);
+                }
                 glib::Propagation::Proceed
             });
         }
@@ -755,6 +986,9 @@ impl App {
                     let mut c = a.cfg.borrow_mut();
                     c.shuffle = b.is_active();
                     c.save();
+                }
+                if let Some(m) = &a.mpris {
+                    m.set_shuffle(b.is_active());
                 }
                 a.rebuild_queue();
             });
@@ -779,6 +1013,9 @@ impl App {
                     btn.remove_css_class("checked");
                 } else {
                     btn.add_css_class("checked");
+                }
+                if let Some(m) = &a.mpris {
+                    m.set_repeat(mode);
                 }
             });
         }
@@ -867,8 +1104,10 @@ impl App {
         {
             let a = app.clone();
             btn_only_lyric.clone().connect_clicked(move |_| {
+                // 右侧整栏就是歌词，这个按钮现在用来整块收起/展开歌词
                 let vis = a.lyric_scroll.is_visible();
                 a.lyric_scroll.set_visible(!vis);
+                a.lyric_tools.set_visible(!vis);
                 // 歌词藏起来时，背景也别孤零零留一块糊图
                 let bg_on = !vis && a.cfg.borrow().cover_bg;
                 a.lyric_bg.set_visible(bg_on);
@@ -916,17 +1155,25 @@ impl App {
                     }
                     c.save();
                 }
+                // 走完正常退出流程：下次启动不必再进安全模式
+                crate::guard::mark_clean();
                 glib::Propagation::Proceed
             });
         }
 
+        crate::guard::log("界面构建完成");
         app.clone().start_tick();
         app.clone().initial_load();
+        if safe_mode {
+            app.set_status("上次异常退出，本次为安全模式：已临时关闭封面背景与跟随封面");
+        }
+
         app
     }
 
     fn initial_load(self: Rc<Self>) {
         // 加载歌词样式后再启动扫描
+        crate::guard::log("initial_load");
         self.restyle_lyrics();
         let has_roots = !self.cfg.borrow().roots.is_empty();
         if has_roots {
@@ -961,7 +1208,6 @@ impl App {
         let view = self.view.borrow().clone();
         let tracks = self.tracks.borrow();
         let cur = self.current.get();
-        let sel_pos = self.selection.selected();
         let mut data = Vec::with_capacity(view.len());
         for (pos, &i) in view.iter().enumerate() {
             let Some(t) = tracks.get(i) else { continue };
@@ -971,7 +1217,6 @@ impl App {
                 sub: t.display_sub(),
                 dur: library::fmt_time(t.dur_ms),
                 playing: cur == Some(i),
-                selected: sel_pos == pos as u32,
             });
         }
         drop(tracks);
@@ -990,14 +1235,12 @@ impl App {
     /// 重绑既浪费又可能被列表吞掉，症状就是切歌后高亮还是上一首。
     fn refresh_row_marks(&self) {
         let cur = self.current.get();
-        let sel_pos = self.selection.selected();
         {
             let view = self.view.borrow();
             let mut rows = self.rows.borrow_mut();
             for (pos, &i) in view.iter().enumerate() {
                 if let Some(r) = rows.get_mut(pos) {
                     r.playing = cur == Some(i);
-                    r.selected = sel_pos == pos as u32;
                 }
             }
         }
@@ -1034,6 +1277,13 @@ impl App {
             Some(t) => t.clone(),
             None => return,
         };
+        if !library::can_decode(&track.path) {
+            let ext = library::extension_of(&track.path).to_uppercase();
+            self.set_status(&format!(
+                "{ext} 目前只能读标签、不能解码播放（可以右键编辑标签）"
+            ));
+            return;
+        }
         self.current.set(Some(idx));
         self.player.load(track.path.clone(), track.dur_ms, autoplay);
         self.update_play_button();
@@ -1067,6 +1317,10 @@ impl App {
             Some(c) if c == idx => {
                 self.player.stop();
                 self.current.set(None);
+                // 桌面上的媒体卡片也别再挂着这首已移除的歌
+                if let Some(m) = &self.mpris {
+                    m.clear();
+                }
             }
             Some(c) if c > idx => self.current.set(Some(c - 1)),
             _ => {}
@@ -1158,17 +1412,6 @@ impl App {
 
     // ================= 界面刷新 =================
     fn update_now_playing(&self, t: &Track) {
-        self.np_title.set_text(&t.title);
-        self.np_artist.set_text(t.display_artist());
-        let mut sub = vec![t.display_album().to_string()];
-        if t.has_composer() {
-            sub.push(format!("作曲 {}", t.composer));
-        }
-        if let Some(y) = t.year {
-            sub.push(y.to_string());
-        }
-        sub.push(t.ext().to_uppercase());
-        self.np_sub.set_text(&sub.join(" · "));
         self.bar_title.set_text(&t.title);
         self.bar_artist.set_text(t.display_artist());
         self.window
@@ -1177,59 +1420,142 @@ impl App {
 
     fn load_art(&self, t: &Track) {
         let blur = self.cfg.borrow().blur;
-        match tags::read_cover(&t.path).and_then(|c| art::from_bytes(&c.data, blur)) {
+        let cover = tags::read_cover(&t.path);
+        // 换歌的同一时刻把元数据推给桌面。封面要的是「文件 URL」，
+        // 内嵌封面先导出一份到缓存目录，GNOME 的媒体卡片才有缩略图。
+        if let Some(m) = &self.mpris {
+            let art = cover
+                .as_ref()
+                .and_then(|c| tags::cover_to_temp(c, &cover_key(&t.path)));
+            m.set_track(
+                &t.title,
+                t.display_artist(),
+                t.display_album(),
+                t.dur_ms,
+                &t.path,
+                art,
+            );
+        }
+        match cover.and_then(|c| art::from_bytes(&c.data, blur)) {
             Some(a) => {
-                // 两处封面各自用「定尺纹理」：Picture 的 natural size 就是纹理尺寸，
+                // 播放条封面用定尺纹理：Picture 的 natural size 就是纹理尺寸，
                 // 直接把原图塞进去，一张 1000px 的封面会把播放条顶高。
-                let big = art::square(&a.cover, STAGE_COVER as u32);
                 let small = art::square(&a.cover, BAR_COVER as u32);
-                self.cover.set_paintable(big.as_ref());
                 self.bar_cover.set_paintable(small.as_ref());
                 // 模糊封面只铺在歌词区，不透明度可配
                 self.lyric_bg.set_paintable(Some(&a.blur));
                 self.lyric_bg
                     .set_opacity(self.cfg.borrow().lyric_bg_opacity as f64);
-                if self.cfg.borrow().accent_follow_cover {
+                // 强调色跟随封面。
+                // 注意先把配置复制出来再算：`if let Some(x) = f(self.cfg.borrow().y)`
+                // 这种写法里 `borrow()` 的临时借用会活到整段 if 结束，块内再
+                // `apply_accent()`（内部 borrow_mut）就会 panic —— 而这个 panic
+                // 发生在 GTK 回调里无法 unwind，整个进程会直接卡死。
+                let (follow, cur_accent) = {
+                    let c = self.cfg.borrow();
+                    (c.accent_follow_cover && !self.safe_mode, c.accent.clone())
+                };
+                if follow {
                     let hex = art::hex(a.accent);
-                    if hex != self.cfg.borrow().accent {
+                    if hex != cur_accent {
                         self.apply_accent(&hex);
                     }
                 }
             }
             None => {
-                self.cover.set_paintable(None::<&gdk::Texture>);
                 self.bar_cover.set_paintable(None::<&gdk::Texture>);
                 self.lyric_bg.set_paintable(None::<&gdk::Texture>);
             }
         }
     }
 
+    /// 换强调色：写配置 + 重载 CSS。
+    ///
+    /// 这里是全应用唯一改强调色的入口，被封面加载、设置页开关、取色器按钮调用。
+    /// 具体写入交给 `write_accent`（借用不到就推迟），这里只管落盘与重载样式表。
     pub fn apply_accent(&self, hex: &str) {
-        {
-            let mut c = self.cfg.borrow_mut();
-            c.accent = hex.to_string();
-            c.save();
+        if !write_accent(&self.cfg, &self.pending_accent, hex) {
+            return;
         }
+        self.cfg.borrow().save();
         self.reload_css();
     }
 
-    /// 歌单左右切换
+    /// tick 里补写被推迟的强调色（见 `apply_accent`）
+    fn flush_pending_accent(&self) {
+        let hex = self.pending_accent.borrow_mut().take();
+        if let Some(hex) = hex {
+            self.apply_accent(&hex);
+        }
+    }
+
+    /// 歌单左右切换。
+    ///
+    /// 两栏在 Paned 里的角色会跟着换：歌单在左时它固定、歌词区吃掉多余宽度；
+    /// 歌单在右时反过来。宽度取配置里记住的值，不按当前窗口重算。
     pub fn apply_layout(&self) {
         let right = self.cfg.borrow().sidebar_right;
+        let want = self.cfg.borrow().sidebar_w.clamp(SIDEBAR_MIN, 1200);
+
+        // 先把两栏摘下来再换位置，避免同一个控件同时被当作 start / end
+        self.body.set_start_child(None::<&gtk::Widget>);
+        self.body.set_end_child(None::<&gtk::Widget>);
+
+        let total = self.body.width();
+        let usable = if total > 1 { total } else { self.window.default_width() };
+
         if right {
-            self.body
-                .reorder_child_after(&self.sidebar, Some(&self.stage));
+            self.body.set_start_child(Some(&self.stage));
+            self.body.set_end_child(Some(&self.sidebar));
+            // 窗口变宽时把余量给歌词（左）而不是歌单（右）
+            self.body.set_resize_start_child(true);
+            self.body.set_resize_end_child(false);
             self.sidebar.add_css_class("right");
+            self.set_paned_pos(paned_position(want, usable, true));
         } else {
-            self.body
-                .reorder_child_after(&self.stage, Some(&self.sidebar));
+            self.body.set_start_child(Some(&self.sidebar));
+            self.body.set_end_child(Some(&self.stage));
+            self.body.set_resize_start_child(false);
+            self.body.set_resize_end_child(true);
             self.sidebar.remove_css_class("right");
+            self.set_paned_pos(paned_position(want, usable, false));
         }
+    }
+
+    /// 程序设置分隔条位置：置位护栏并记住写入值
+    fn set_paned_pos(&self, pos: i32) {
+        self.paned_self.set(true);
+        self.body.set_position(pos);
+        self.paned_self.set(false);
+    }
+
+    /// 分隔条被拖动：把位置折算成歌单宽度记进配置。
+    /// 返回 true 表示宽度确实变了（调用方负责延迟落盘）。
+    fn on_paned_moved(&self) -> bool {
+        if self.paned_self.get() {
+            return false;
+        }
+        let total = self.body.width();
+        if total <= 1 {
+            return false;
+        }
+        let pos = self.body.position();
+        let right = self.cfg.borrow().sidebar_right;
+        let w = sidebar_width(pos, total, right);
+        if w < SIDEBAR_MIN || w > total - STAGE_MIN {
+            return false; // 拖动过程中的中间态 / 越界值，别记
+        }
+        if self.cfg.borrow().sidebar_w == w {
+            return false;
+        }
+        self.cfg.borrow_mut().sidebar_w = w;
+        self.paned_epoch.set(self.paned_epoch.get().wrapping_add(1));
+        true
     }
 
     /// 是否用封面当歌词背景
     pub fn apply_cover_bg(&self) {
-        let on = self.cfg.borrow().cover_bg;
+        let on = self.cfg.borrow().cover_bg && !self.safe_mode;
         self.lyric_bg.set_visible(on);
         self.lyric_scrim.set_visible(on);
     }
@@ -1259,41 +1585,52 @@ impl App {
     }
 
     // ================= 歌词 =================
+    /// 四个来源按固定优先级找：内嵌标签 → 歌词文件夹 → 音频同目录 → 上次在线缓存，
+    /// 都没有才发网络请求。
     pub fn load_lyrics(&self, t: &Track) {
-        let mut text: Option<String> = None;
-        let side = t.path.with_extension("lrc");
-        if let Ok(s) = std::fs::read_to_string(&side) {
-            if !s.trim().is_empty() {
-                text = Some(s);
+        let tag = tags::read_lyrics(&t.path);
+        // borrow 单独一句取出来，别让它活到下面的 &self 调用里
+        let dir = { self.cfg.borrow().lyric_dir.clone() };
+        let folder = dir
+            .and_then(|d| lyrics::find_in_dir(&d, t))
+            .map(|(_, s)| s);
+        let beside = lyrics::find_beside(t).map(|(_, s)| s);
+        let cache = read_lyric_cache(&t.path);
+
+        if let Some((from, s)) = lyrics::pick(tag, folder, beside, cache) {
+            let lyr = lrc::parse(&s);
+            if !lyr.is_empty() {
+                if from != lyrics::From::Tag {
+                    crate::guard::log(&format!(
+                        "歌词来自{}：{}",
+                        match from {
+                            lyrics::From::Folder => "歌词文件夹",
+                            lyrics::From::Beside => "同目录 lrc",
+                            lyrics::From::Cache => "在线缓存",
+                            lyrics::From::Tag => "标签",
+                        },
+                        t.path.display()
+                    ));
+                }
+                self.set_lyrics(lyr);
+                return;
             }
         }
-        if text.is_none() {
-            text = tags::read_lyrics(&t.path);
-        }
-        match text {
-            Some(s) => self.set_lyrics(lrc::parse(&s)),
-            None => {
-                self.set_lyrics(Lyrics::default());
-                if let Some(cached) = read_lyric_cache(&t.path) {
-                    self.set_lyrics(lrc::parse(&cached));
-                    return;
-                }
-                if self.cfg.borrow().auto_lyric {
-                    self.set_status("没有内嵌歌词，正在自动在线匹配…");
-                    let (tx, rx) =
-                        std::sync::mpsc::channel::<(PathBuf, Result<crate::online::LyricHit, String>)>();
-                    let t2 = t.clone();
-                    std::thread::spawn(move || {
-                        let r = crate::online::fetch_lyrics(
-                            &t2.artist, &t2.title, &t2.album, t2.dur_ms,
-                        );
-                        let _ = tx.send((t2.path.clone(), r));
-                    });
-                    *self.lyric_rx.borrow_mut() = Some(rx);
-                } else {
-                    self.set_status("这首歌还没有歌词，点歌词栏右侧搜索按钮在线抓取");
-                }
-            }
+
+        self.set_lyrics(Lyrics::default());
+        if self.cfg.borrow().auto_lyric {
+            self.set_status("没有内嵌歌词，正在自动在线匹配…");
+            let (tx, rx) =
+                std::sync::mpsc::channel::<(PathBuf, Result<crate::online::LyricHit, String>)>();
+            let t2 = t.clone();
+            std::thread::spawn(move || {
+                let r =
+                    crate::online::fetch_lyrics(&t2.artist, &t2.title, &t2.album, t2.dur_ms);
+                let _ = tx.send((t2.path.clone(), r));
+            });
+            *self.lyric_rx.borrow_mut() = Some(rx);
+        } else {
+            self.set_status("这首歌还没有歌词，点歌词栏右侧搜索按钮在线抓取");
         }
     }
 
@@ -1302,7 +1639,14 @@ impl App {
             self.lyric_box.remove(&child);
         }
         self.lyric_labels.borrow_mut().clear();
+        self.lyric_line_of_label.borrow_mut().clear();
+        self.lyric_filled.set(usize::MAX);
         self.cur_line.set(None);
+        // 换了首歌/重新载入歌词：之前的「手动滚动静默期」作废，立刻回到当前行
+        self.lyric_hold_until.set(None);
+        // 紧接着会重排内容，滚动条可能被钳位；这段窗口内的变化不算人手滚动
+        self.lyric_settle_until
+            .set(Some(Instant::now() + Duration::from_millis(400)));
         if lyr.is_empty() {
             let empty = gtk::Label::new(Some("暂无歌词"));
             empty.add_css_class("np-sub");
@@ -1315,7 +1659,8 @@ impl App {
         let color = self.lyric_color();
         let synced = lyr.synced;
         let mut labels = Vec::new();
-        for line in lyr.lines.iter() {
+        let mut line_of_label: Vec<usize> = Vec::new();
+        for (line_i, line) in lyr.lines.iter().enumerate() {
             if style.hide_empty && line.text.trim().is_empty() && line.trans.is_none() {
                 continue;
             }
@@ -1340,22 +1685,21 @@ impl App {
             l.set_margin_bottom((style.line_spacing / 2).max(2));
             l.set_margin_start(10);
             l.set_margin_end(10);
-            self.apply_lyric_attrs(&l, &style, color, false);
+            self.apply_lyric_attrs(&l, &style, color, RowState::Idle, 0);
             if synced {
-                let player = self.player.clone();
-                let time = line.time;
-                let click = gtk::GestureClick::new();
-                click.connect_released(move |_, _, _, _| {
-                    player.seek(time);
-                });
-                l.add_controller(click);
+                // 点击跳转不再挂在每个 label 上：label 上一挂 GtkGestureClick，
+                // 它在按下瞬间就会 claim 事件序列，父级「按住拖动滚动」的手势
+                // 永远抢不到事件——只能拖滚动条，直接拖歌词纹丝不动。
+                // 现在统一由 lyric_box 上的一个手势处理（点=跳、拖=滚）。
                 l.set_cursor_from_name(Some("pointer"));
             }
             self.lyric_box.append(&l);
             labels.push(l);
+            line_of_label.push(line_i);
         }
         *self.lyrics.borrow_mut() = lyr;
         *self.lyric_labels.borrow_mut() = labels;
+        *self.lyric_line_of_label.borrow_mut() = line_of_label;
         // 立即定位到当前行
         let pos = self.shared.pos();
         if let Some(idx) = self.lyrics.borrow().index_at(pos) {
@@ -1379,39 +1723,19 @@ impl App {
         }
     }
 
+    /// 把一行歌词的状态刷到标签上（字体、颜色、不透明度）。
     fn apply_lyric_attrs(
         &self,
         l: &gtk::Label,
         style: &crate::config::LyricStyle,
         color: (u8, u8, u8),
-        active: bool,
+        state: RowState,
+        filled: usize,
     ) {
-        let attrs = pango::AttrList::new();
-        let size = if active {
-            style.font_size as f64 * 1.16
-        } else {
-            style.font_size as f64
-        };
-        attrs.insert(pango::AttrSize::new((size as i32) * pango::SCALE));
-        if active {
-            attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
-            let ac = art::parse_hex(&self.cfg.borrow().accent);
-            attrs.insert(pango::AttrColor::new_foreground(
-                (ac.0 as u16) * 257,
-                (ac.1 as u16) * 257,
-                (ac.2 as u16) * 257,
-            ));
-            l.set_opacity(1.0);
-        } else {
-            attrs.insert(pango::AttrInt::new_weight(pango::Weight::Normal));
-            attrs.insert(pango::AttrColor::new_foreground(
-                (color.0 as u16) * 257,
-                (color.1 as u16) * 257,
-                (color.2 as u16) * 257,
-            ));
-            l.set_opacity(style.dim.clamp(0.12, 1.0) as f64);
-        }
+        let accent = art::parse_hex(&self.cfg.borrow().accent);
+        let (attrs, opacity) = lyric_attrs(style, color, accent, state, filled, l.text().len());
         l.set_attributes(Some(&attrs));
+        l.set_opacity(opacity);
     }
 
     pub fn restyle_lyrics(&self) {
@@ -1425,6 +1749,14 @@ impl App {
         self.set_lyrics(lyr);
     }
 
+    /// 人手滚动歌词后的静默期：期间既不回弹也不重新定位
+    fn lyric_hold_active(&self) -> bool {
+        self.lyric_hold_until
+            .get()
+            .map(|t| Instant::now() < t)
+            .unwrap_or(false)
+    }
+
     /// 当前行必须停在歌词控件的中线上。
     ///
     /// 之前是按「估算行高」累加算每行 y：label 还没布局时 `height()` 是 0，
@@ -1433,6 +1765,10 @@ impl App {
     /// 现在直接问 GTK 要真实位置（`compute_bounds`），而且首尾各留半个视口，
     /// 保证第一行、最后一行也能停在中线。
     fn update_lyric_scroll(&self, animate: bool) {
+        // 用户正在自己翻歌词：别抢滚动位置，等静默期结束再归位
+        if animate && self.lyric_hold_active() {
+            return;
+        }
         let Some(cur) = self.cur_line.get() else {
             return;
         };
@@ -1452,9 +1788,15 @@ impl App {
             self.lyric_box.set_margin_bottom(half as i32);
         }
 
-        let i = cur.min(labels.len() - 1);
+        // cur 是歌词行下标，标签可能因 hide_empty 少几行，必须走映射
+        let Some(i) = self.label_index_of_line(cur) else {
+            return;
+        };
+        let Some(label) = labels.get(i) else {
+            return;
+        };
         // compute_bounds 给的是相对 lyric_box 的坐标，不受滚动位置影响
-        let Some(b) = labels[i].compute_bounds(&self.lyric_box) else {
+        let Some(b) = label.compute_bounds(&self.lyric_box) else {
             return;
         };
         let h = b.height() as f64;
@@ -1465,32 +1807,89 @@ impl App {
         drop(labels);
         self.lyric_target.set(target);
         if !animate {
+            self.lyric_set_value.set(target);
             let adj = self.lyric_scroll.vadjustment();
             adj.set_value(target);
         }
     }
 
+    /// 每帧朝目标追一段（30fps 下约 0.6~0.8s 到位）。
+    /// 关键词是「每帧都动」：整块歌词像传送带一样连续上移，
+    /// 而不是攒够一行再猛地跳一格。
     fn animate_scroll(&self) {
+        if self.lyric_hold_active() {
+            return;
+        }
         let target = self.lyric_target.get();
         let adj = self.lyric_scroll.vadjustment();
         let cur = adj.value();
         let diff = target - cur;
-        if diff.abs() > 0.7 {
-            adj.set_value(cur + diff * 0.22);
+        if diff.abs() > 0.5 {
+            let next = cur + diff * 0.12;
+            self.lyric_set_value.set(next);
+            adj.set_value(next);
+        } else if diff.abs() > 0.01 {
+            self.lyric_set_value.set(target);
+            adj.set_value(target);
         }
+    }
+
+    /// 歌词行下标 -> 标签下标（hide_empty 跳过空行时两者不同）
+    fn label_index_of_line(&self, line: usize) -> Option<usize> {
+        self.lyric_line_of_label
+            .borrow()
+            .iter()
+            .position(|&l| l == line)
     }
 
     fn highlight_line(&self, idx: Option<usize>) {
         let labels = self.lyric_labels.borrow().clone();
+        let line_of = self.lyric_line_of_label.borrow().clone();
         if labels.is_empty() {
             return;
         }
         let style = self.cfg.borrow().lyric.clone();
         let color = self.lyric_color();
         for (i, l) in labels.iter().enumerate() {
-            self.apply_lyric_attrs(l, &style, color, Some(i) == idx);
+            let state = match (line_of.get(i).copied(), idx) {
+                (Some(a), Some(b)) if a == b => RowState::Active,
+                (Some(a), Some(b)) if a < b => RowState::Sung,
+                _ => RowState::Idle,
+            };
+            self.apply_lyric_attrs(l, &style, color, state, 0);
         }
         self.cur_line.set(idx);
+        self.lyric_filled.set(0); // 新行从第一个字开始填，tick 里继续推进
+    }
+
+    /// 卡拉OK填充：当前行唱到哪个字节，就把哪部分点亮。
+    ///
+    /// 只有填充位变化时才重设 Pango 属性——每秒几十次 tick，
+    /// 一帧内绝大多数调用都是空转，不能每帧重建属性表。
+    fn paint_lyric_fill(&self, pos: u64) {
+        let Some(line_i) = self.cur_line.get() else {
+            return;
+        };
+        let Some(label_i) = self.label_index_of_line(line_i) else {
+            return;
+        };
+        let Some(label) = self.lyric_labels.borrow().get(label_i).cloned() else {
+            return;
+        };
+        let filled = {
+            let lyr = self.lyrics.borrow();
+            let Some(line) = lyr.lines.get(line_i) else {
+                return;
+            };
+            line.sung_cut(pos, lyr.line_end(line_i))
+        };
+        if filled == self.lyric_filled.get() {
+            return;
+        }
+        self.lyric_filled.set(filled);
+        let style = self.cfg.borrow().lyric.clone();
+        let color = self.lyric_color();
+        self.apply_lyric_attrs(&label, &style, color, RowState::Active, filled);
     }
 
     // ================= 定时刷新 =================
@@ -1503,6 +1902,8 @@ impl App {
     }
 
     fn tick(&self) {
+        // 上一帧因为 cfg 被借用而推迟的强调色，这里补写
+        self.flush_pending_accent();
         let pos = self.shared.pos();
         let dur = self.shared.dur();
         if dur != self.last_dur.get() {
@@ -1520,6 +1921,10 @@ impl App {
         }
         self.pos_label.set_text(&library::fmt_time(pos));
         self.update_play_button();
+        // 把播放/暂停状态同步给桌面（内部只在变化时广播，33ms 一次不心疼）
+        if let Some(m) = &self.mpris {
+            m.sync();
+        }
 
         // 歌词跟随
         let (synced, cur_idx) = {
@@ -1529,6 +1934,9 @@ impl App {
         if synced {
             if cur_idx != self.cur_line.get() {
                 self.highlight_line(cur_idx);
+            } else if cur_idx.is_some() {
+                // 同一行内逐字点亮（卡拉OK填充）
+                self.paint_lyric_fill(pos);
             }
             // 每帧校正一次：换行要回中线，窗口缩放/字号变化也要重新对齐
             self.update_lyric_scroll(true);
@@ -1573,16 +1981,48 @@ impl App {
                     Ok(hit) => {
                         let lyr = lrc::parse(&hit.lrc);
                         if !lyr.is_empty() {
+                            // 缓存一份：下次断网也能直接显示
                             write_lyric_cache(&path, &hit.lrc);
-                            self.set_lyrics(lyr);
-                            self.set_status(&format!(
-                                "已自动匹配歌词（{}）",
-                                if hit.source.is_empty() {
-                                    "在线"
-                                } else {
-                                    &hit.source
+                            // 「自动下载到歌词文件夹」勾了才落一个用户可见的文件；
+                            // 没勾就只在内存里展示，别往人家目录里塞东西
+                            let (dir, auto) = {
+                                let c = self.cfg.borrow();
+                                (c.lyric_dir.clone(), c.lyric_auto_save)
+                            };
+                            let mut saved: Option<PathBuf> = None;
+                            if auto {
+                                if let Some(d) = dir {
+                                    let hit_track = self
+                                        .tracks
+                                        .borrow()
+                                        .iter()
+                                        .find(|t| t.path == path)
+                                        .cloned();
+                                    if let Some(t) = hit_track {
+                                        saved = lyrics::save(&d, &t, &hit.lrc).ok();
+                                    }
                                 }
-                            ));
+                            }
+                            self.set_lyrics(lyr);
+                            let source = if hit.source.is_empty() {
+                                "在线"
+                            } else {
+                                &hit.source
+                            };
+                            match saved {
+                                Some(p) => {
+                                    let name = p
+                                        .file_name()
+                                        .map(|s| s.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    self.set_status(&format!(
+                                        "已匹配歌词（{source}），存为歌词文件夹里的 {name}"
+                                    ));
+                                }
+                                None => self.set_status(&format!(
+                                    "已自动匹配歌词（{source}），未保存到磁盘"
+                                )),
+                            }
                         }
                     }
                     Err(_) => self.set_status("没找到匹配歌词，可以手动在线搜索"),
@@ -1642,12 +2082,23 @@ impl App {
             }
             Ok(ScanMsg::Done(tracks)) => {
                 let n = tracks.len();
+                crate::guard::log(&format!("扫描完成 {n} 首"));
                 *app.tracks.borrow_mut() = *tracks;
                 let q = app.search.text().to_string();
                 app.apply_filter(&q);
                 app.set_status(&format!("曲库共 {n} 首 · 双击或回车播放"));
-                if let Some(last) = app.cfg.borrow().last_track.clone() {
-                    if let Some(idx) = app.tracks.borrow().iter().position(|t| t.path == last) {
+                // 先把 last_track 拷出来：`if let Some(x) = app.cfg.borrow().y`
+                // 里那个借用在整段块内都活着，块里的 load_art 会去写 cfg
+                // （跟随封面时改强调色），届时 RefCell 二次借用直接 panic。
+                let last = { app.cfg.borrow().last_track.clone() };
+                if let Some(last) = last {
+                    // 同样先算出下标，别让 tracks 的借用在 load_art/load_lyrics 期间活着
+                    let idx = app
+                        .tracks
+                        .borrow()
+                        .iter()
+                        .position(|t| t.path == last && library::can_decode(&t.path));
+                    if let Some(idx) = idx {
                         app.current.set(Some(idx));
                         let t = app.tracks.borrow()[idx].clone();
                         app.update_now_playing(&t);
@@ -1717,6 +2168,158 @@ impl App {
 
     pub fn refresh_lyric_offset(&self) {
         self.update_lyric_scroll(true);
+    }
+
+    // ================= 歌词区鼠标输入 =================
+    /// 按住拖动歌词 = 平移滚动，轻点 = 跳到那一句。
+    ///
+    /// GTK4 的 GtkScrolledWindow 只给触摸屏做了拖拽平移（内部手势是
+    /// `touch_only`），鼠标按住歌词内容是完全没反应的——想翻歌词只能去够
+    /// 右边那条一两像素宽的浮动滚动条，很难按。这里补一个鼠标拖拽手势，
+    /// 手感跟拖滚动条一致：内容一像素一像素跟着指针走，松手后停留 3 秒，
+    /// 再由 `animate_scroll` 平滑地滑回当前行（不是瞬间跳过去）。
+    fn wire_lyric_input(self: &Rc<Self>) {
+        let drag = gtk::GestureDrag::new();
+        drag.set_button(gdk::BUTTON_PRIMARY);
+        // Capture：抢在 ScrolledWindow 内部手势之前拿到事件
+        drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+        {
+            let a = self.clone();
+            drag.connect_drag_begin(move |_, x, y| {
+                a.lyric_drag_from.set(a.lyric_scroll.vadjustment().value());
+                a.lyric_drag_moved.set(false);
+                a.lyric_drag_start.set((x, y));
+                // 拖的时候先按住静默期，别让 tick 一边拖一边把位置抢回去
+                a.lyric_hold_until
+                    .set(Some(Instant::now() + LYRIC_RESUME_AFTER));
+            });
+        }
+        {
+            let a = self.clone();
+            drag.connect_drag_update(move |_, dx, dy| {
+                // 3px 死区：手抖不算拖，否则「点歌词跳转」会时灵时不灵
+                if !a.lyric_drag_moved.get() && dx.abs() < 3.0 && dy.abs() < 3.0 {
+                    return;
+                }
+                a.lyric_drag_moved.set(true);
+                let adj = a.lyric_scroll.vadjustment();
+                let max = (adj.upper() - adj.page_size()).max(adj.lower());
+                // 指针往上拖（dy<0）→ 内容上移 → 滚动值变大
+                let v = lyric_drag_scroll(a.lyric_drag_from.get(), dy, adj.lower(), max);
+                a.lyric_set_value.set(v);
+                adj.set_value(v);
+                // 一直拖就一直续期：拖多久都不回弹
+                a.lyric_hold_until
+                    .set(Some(Instant::now() + LYRIC_RESUME_AFTER));
+            });
+        }
+        {
+            let a = self.clone();
+            drag.connect_drag_end(move |_, _, _| {
+                if a.lyric_drag_moved.get() {
+                    // 松手：从此刻起再等 3 秒才回弹
+                    a.lyric_hold_until
+                        .set(Some(Instant::now() + LYRIC_RESUME_AFTER));
+                } else {
+                    let (x, y) = a.lyric_drag_start.get();
+                    a.seek_lyric_at(x, y);
+                }
+            });
+        }
+        self.lyric_box.add_controller(drag);
+    }
+
+    /// 点歌词跳转：用真实布局位置判断点到了哪一行（不按行高估算）
+    fn seek_lyric_at(&self, _x: f64, y: f64) {
+        let (synced, times) = {
+            let l = self.lyrics.borrow();
+            (l.synced, l.lines.iter().map(|x| x.time).collect::<Vec<_>>())
+        };
+        if !synced {
+            return;
+        }
+        let labels = self.lyric_labels.borrow();
+        let line_of = self.lyric_line_of_label.borrow();
+        for (i, l) in labels.iter().enumerate() {
+            let Some(b) = l.compute_bounds(&self.lyric_box) else {
+                continue;
+            };
+            let top = b.y() as f64;
+            if y >= top && y < top + b.height() as f64 {
+                let Some(&line) = line_of.get(i) else { return };
+                let Some(&t) = times.get(line) else { return };
+                // 跳转后立刻结束静默期，让视图马上开始滑到新的当前行
+                self.lyric_hold_until.set(None);
+                self.player.seek(t);
+                return;
+            }
+        }
+    }
+
+    // ================= MPRIS =================
+    /// 把系统侧的控制接回播放器：GNOME 面板上的按钮、键盘多媒体键、
+    /// `playerctl play-pause` 走的都是这条路径。
+    fn wire_mpris(self: &Rc<Self>) {
+        let Some(m) = self.mpris.clone() else { return };
+        let pp = Rc::downgrade(self);
+        let nx = Rc::downgrade(self);
+        let pv = Rc::downgrade(self);
+        let sk = Rc::downgrade(self);
+        let vb = Rc::downgrade(self);
+        let rs = Rc::downgrade(self);
+        let qt = Rc::downgrade(self);
+        m.set_control(crate::mpris::Control {
+            play_pause: Box::new(move || {
+                if let Some(a) = pp.upgrade() {
+                    a.toggle_play();
+                }
+            }),
+            next: Box::new(move || {
+                if let Some(a) = nx.upgrade() {
+                    a.next_track(true);
+                }
+            }),
+            prev: Box::new(move || {
+                if let Some(a) = pv.upgrade() {
+                    a.prev_track();
+                }
+            }),
+            seek_ms: Box::new(move |ms| {
+                if let Some(a) = sk.upgrade() {
+                    a.seek_to_ms(ms);
+                }
+            }),
+            // 外部推音量：直接推我们自己的音量条，UI 和引擎一次同步好
+            set_volume: Box::new(move |v| {
+                if let Some(a) = vb.upgrade() {
+                    a.vol_scale.set_value(v);
+                }
+            }),
+            raise: Box::new(move || {
+                if let Some(a) = rs.upgrade() {
+                    a.window.present();
+                }
+            }),
+            quit: Box::new(move || {
+                if let Some(a) = qt.upgrade() {
+                    a.window.close();
+                }
+            }),
+        });
+        m.set_shuffle(self.shuffle_btn.is_active());
+        m.set_repeat(self.cfg.borrow().repeat);
+        m.set_volume(self.shared.volume() as f64);
+    }
+
+    /// 外部要求跳转（毫秒）。和拖进度条一样，短暂锁住进度条的自动跟随，
+    /// 免得刻度被下一帧的旧位置拽回去。
+    fn seek_to_ms(&self, ms: u64) {
+        self.user_seek_at.set(Some(Instant::now()));
+        self.player.seek(ms);
+        let dur = self.shared.dur();
+        if dur > 0 {
+            self.pos_scale.set_value(ms.min(dur) as f64);
+        }
     }
 }
 
@@ -1826,12 +2429,28 @@ fn lyric_cache_path(path: &std::path::Path) -> PathBuf {
         .join(format!("{:016x}.lrc", h.finish()))
 }
 
+/// 导出给桌面（MPRIS）的封面文件名。
+/// 用「路径 + 修改时间」哈希：同一首歌每次落到同一个文件，换了封面又自动换名，
+/// 不会让 GNOME 一直显示旧图。
+fn cover_key(path: &std::path::Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut h);
+    if let Ok(md) = std::fs::metadata(path) {
+        if let Ok(t) = md.modified() {
+            if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                d.as_secs().hash(&mut h);
+            }
+        }
+    }
+    format!("mpris-{:016x}", h.finish())
+}
+
 fn read_lyric_cache(path: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(lyric_cache_path(path)).ok().filter(|s| !s.trim().is_empty())
 }
 
-fn write_lyric_cache(path: &std::path::Path, text: &str) {
-    let p = lyric_cache_path(path);
+fn write_lyric_cache(path: &std::path::Path, text: &str) {    let p = lyric_cache_path(path);
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -1876,6 +2495,27 @@ pub fn write_temp_cover(cover: &tags::Cover, name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
+    /// 直接拖歌词 = 平移滚动：向下拖内容跟着下移（滚动值变小）、
+    /// 向上拖内容上移（滚动值变大），并且两端要钳住，不能把内容拽飞。
+    #[test]
+    fn drag_scroll_follows_the_pointer() {
+        // 起点 100，指针往下拖 30px → 内容下移 → 滚动值 -30
+        assert!((lyric_drag_scroll(100.0, 30.0, 0.0, 1000.0) - 70.0).abs() < 1e-9);
+        // 往上拖 30px → +30
+        assert!((lyric_drag_scroll(100.0, -30.0, 0.0, 1000.0) - 130.0).abs() < 1e-9);
+        // 拖过头：钳在内容范围里
+        assert_eq!(lyric_drag_scroll(5.0, 200.0, 0.0, 1000.0), 0.0);
+        assert_eq!(lyric_drag_scroll(990.0, -200.0, 0.0, 1000.0), 1000.0);
+        // 内容比视口还短（max < lower）时不 panic、停在原来的位置
+        assert_eq!(lyric_drag_scroll(0.0, 10.0, 0.0, -50.0), 0.0);
+    }
+
+    /// 静止时（dy=0）滚动值不许变，否则按下就抖一下
+    #[test]
+    fn drag_scroll_is_stable_without_motion() {
+        assert!((lyric_drag_scroll(321.5, 0.0, 0.0, 4000.0) - 321.5).abs() < 1e-9);
+    }
 
     /// 歌词背景是 overlay 层：它不能参与尺寸计算，
     /// 否则一张大封面会反过来把歌词区顶高，破坏「中间弹性」。
@@ -1928,7 +2568,7 @@ mod layout_tests {
         let mine = row
             .css_classes()
             .iter()
-            .filter(|c| *c == "playing" || *c == "sel")
+            .filter(|c| *c == "playing")
             .count();
         assert_eq!(mine, 0, "状态类必须清空（GTK 自带的 horizontal 不算）");
     }
@@ -1972,6 +2612,90 @@ mod layout_tests {
         assert_eq!(lit, vec![2], "只能有第 3 行是正在播放");
     }
 
+    /// 收集属性表里某一类属性的区间（用于检查卡拉OK的切分位置）
+    fn ranges_of(list: &pango::AttrList, ty: pango::AttrType) -> Vec<(u32, u32)> {
+        let mut v: Vec<(u32, u32)> = Vec::new();
+        for attrs in list.iterator() {
+            for a in attrs {
+                if a.type_() == ty {
+                    v.push((a.start_index(), a.end_index()));
+                }
+            }
+        }
+        v.sort();
+        v
+    }
+
+    /// 正在唱的行必须被切成「已唱 / 未唱」两段，切点正好是填充字节数。
+    #[test]
+    fn active_line_is_split_at_fill_position() {
+        let style = crate::config::LyricStyle::default();
+        let (attrs, opacity) =
+            lyric_attrs(&style, (200, 200, 200), (255, 90, 60), RowState::Active, 4, 10);
+        assert_eq!(opacity, 1.0, "当前行不压暗");
+        let fg = ranges_of(&attrs, pango::AttrType::Foreground);
+        assert!(
+            fg.contains(&(0, 4)),
+            "已唱 [0,4) 要单独覆盖成强调色，实际 {fg:?}"
+        );
+        assert!(
+            fg.iter().any(|&(s, e)| s == 0 && e >= 10),
+            "整行还要有正文色打底，实际 {fg:?}"
+        );
+        assert!(
+            ranges_of(&attrs, pango::AttrType::ForegroundAlpha).is_empty(),
+            "未唱的部分不该压暗：那是下一句词，要能提前读到"
+        );
+    }
+
+    /// 刚换行时整行都还没唱；唱完后整行实心，不能出现退化区间。
+    #[test]
+    fn fill_position_is_clamped_to_line() {
+        let style = crate::config::LyricStyle::default();
+        let (a, _) = lyric_attrs(&style, (200, 200, 200), (255, 90, 60), RowState::Active, 0, 6);
+        assert_eq!(ranges_of(&a, pango::AttrType::Foreground), vec![(0, 6)]);
+        let (b, _) = lyric_attrs(&style, (200, 200, 200), (255, 90, 60), RowState::Active, 99, 6);
+        assert_eq!(ranges_of(&b, pango::AttrType::Foreground), vec![(0, 6)]);
+        assert!(
+            ranges_of(&b, pango::AttrType::ForegroundAlpha).is_empty(),
+            "整行唱完就没有压暗区间了（空区间会被 Pango 丢掉）"
+        );
+    }
+
+    /// 非当前行不参与填充：只有一整段基础色，且没唱的更暗。
+    #[test]
+    fn idle_and_sung_lines_have_no_fill() {
+        let style = crate::config::LyricStyle::default();
+        let (idle, o_idle) =
+            lyric_attrs(&style, (200, 200, 200), (255, 90, 60), RowState::Idle, 0, 8);
+        let (sung, o_sung) =
+            lyric_attrs(&style, (200, 200, 200), (255, 90, 60), RowState::Sung, 0, 8);
+        assert!(ranges_of(&idle, pango::AttrType::ForegroundAlpha).is_empty());
+        assert!(ranges_of(&sung, pango::AttrType::ForegroundAlpha).is_empty());
+        assert!(o_sung > o_idle, "唱过的行要比没唱的亮");
+    }
+
+    /// 主题 CSS 必须能被 GTK 原样解析：写错一个伪类或属性，
+    /// GTK 只会默默丢掉整条规则，界面看起来就是"样式没生效"。
+    #[test]
+    fn theme_css_has_no_parse_errors() {
+        if !gtk::is_initialized() && gtk::init().is_err() {
+            println!("跳过：没有可用的 display");
+            return;
+        }
+        let provider = gtk::CssProvider::new();
+        let errs = Rc::new(Cell::new(0u32));
+        let e = errs.clone();
+        provider.connect_parsing_error(move |_, _section, err| {
+            eprintln!("主题 CSS 解析错误：{err}");
+            e.set(e.get() + 1);
+        });
+        for dark in [true, false] {
+            provider.load_from_string(&theme::css("#3B82F6", dark));
+        }
+        assert_eq!(errs.get(), 0, "主题 CSS 有解析错误");
+    }
+
     /// 主题必须按代码里实际挂类的节点（.track-row）来写选择器。
     /// 曾经写成 `.tracklist > row.playing`：列表的 row 节点拿不到，规则永不命中，
     /// 于是「正在播放」怎么切都不变。
@@ -1984,6 +2708,85 @@ mod layout_tests {
             !css.contains("> row.playing"),
             "别把选择器写回列表的 row 节点，那里挂不上类"
         );
+    }
+
+    /// 借用还活着时改强调色不能 panic（旧代码在这里 panic，把整个进程带走了）。
+    /// 正确行为：当场不写，记进 pending；借用释放后补写并返回「要重载样式表」。
+    #[test]
+    fn write_accent_defers_instead_of_panicking() {
+        let cfg = std::cell::RefCell::new(Config::default());
+        let pending = std::cell::RefCell::new(None);
+        let before = cfg.borrow().accent.clone();
+
+        {
+            // 模拟 `if let ... = f(cfg.borrow().x)` 里那个活到块尾的借用
+            let _held = cfg.borrow();
+            assert!(!write_accent(&cfg, &pending, "#123456"), "借用中不该当场写");
+            assert_eq!(*pending.borrow(), Some("#123456".to_string()));
+        }
+        assert_eq!(cfg.borrow().accent, before, "借用期间配置不能被动过");
+
+        assert!(write_accent(&cfg, &pending, "#123456"), "借用释放后应当写入");
+        assert_eq!(cfg.borrow().accent, "#123456");
+        assert!(pending.borrow().is_none(), "补写后待写入值要清掉");
+
+        // 颜色没变：不必重载整张样式表
+        assert!(!write_accent(&cfg, &pending, "#123456"));
+    }
+
+    /// 回归：「跟随封面」卡死的根因是 `if let` 条件里的 `cfg.borrow()` 活到块尾，
+    /// 块内 `apply_accent()` 再 borrow_mut → panic → GTK 回调无法 unwind → 假死。
+    /// 这条测试直接扫源码，禁止这种写法再出现。
+    #[test]
+    fn no_cfg_borrow_in_if_let_condition() {
+        const COND: &str = "if let";
+        const BORROW: &str = ".cfg.borrow()";
+        for (name, src) in [
+            ("ui/mod.rs", include_str!("mod.rs")),
+            ("ui/dialogs.rs", include_str!("dialogs.rs")),
+        ] {
+            for (n, line) in src.lines().enumerate() {
+                let t = line.trim();
+                if t.starts_with("//") || t.starts_with('*') || t.starts_with("/*") {
+                    continue;
+                }
+                assert!(
+                    !(t.contains(COND) && t.contains(BORROW)),
+                    "{name}:{} 条件里借用 cfg，块内再 borrow_mut 会 panic：{t}",
+                    n + 1
+                );
+            }
+        }
+    }
+
+    /// 分隔条的「位置」和「歌单宽度」必须能来回换算：
+    /// 歌单在左右两侧时含义相反，配错方向会让拖动条一碰就跳。
+    #[test]
+    fn paned_position_roundtrips_sidebar_width() {
+        let total = 1200;
+        for &right in &[false, true] {
+            for &w in &[240, 320, 392, 560] {
+                let pos = paned_position(w, total, right);
+                assert_eq!(pos, if right { total - w } else { w }, "宽度 {w} 的位置算错");
+                assert_eq!(
+                    sidebar_width(pos, total, right),
+                    w,
+                    "位置回读宽度对不上（right={right} w={w}）"
+                );
+            }
+        }
+    }
+
+    /// 窗口很窄时钳位不能 panic（clamp 的 min > max 会崩），也不能把歌词区挤没。
+    #[test]
+    fn paned_position_clamps_on_narrow_window() {
+        for total in [320, 400, 560, 700] {
+            for &right in &[false, true] {
+                let pos = paned_position(900, total, right);
+                assert!(pos >= SIDEBAR_MIN.min(total), "位置越界：{pos} total={total}");
+                assert!(pos <= total.max(SIDEBAR_MIN), "位置越界：{pos} total={total}");
+            }
+        }
     }
 
     /// 当前行必须落在视口中线：内容坐标 - 滚动值 = 半屏。
