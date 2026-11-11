@@ -195,6 +195,24 @@ sudo dpkg -i dist/owlmusic_0.1.0_amd64.deb
 
 装了之后会出现在应用菜单里，`audio/*` 的 MIME 也注册了（文件管理器里右键「用 OwlMusic 打开」）。卸载：`sudo apt remove owlmusic`。
 
+只换图标、不想重新编译 Rust 时：`OWLMUSIC_BIN=已有二进制路径 ./build-deb.sh`；
+开发时直接跑 `target/debug/owlmusic` 的话，执行 `./install-icon.sh` 把图标装到用户级 hicolor 即可。
+
+## 应用图标
+
+![新图标、旧图标与多尺寸效果](docs/icon-preview.png)
+
+`resources/io.github.owl.owlmusic.svg` 是正式稿：深靛夜色底、闭着眼听歌的猫头鹰、
+暖琥珀色点缀，背景两道同心圆是声波。没有用「大眼珠 + 耳机」那套卡通画法，
+小尺寸也不靠一堆细节硬撑。
+
+- `resources/io.github.owl.owlmusic-small.svg` 是 16/24/32px 专用简化稿：去掉星点、
+  声波、胸羽和角落音符，主体放大、闭眼弧加粗，缩到 16px 仍认得出是猫头鹰。
+- `resources/icons/hicolor/<尺寸>x<尺寸>/apps/` 是预渲染的 PNG（16 ~ 512），
+  `build-deb.sh` 会连同 scalable SVG 一起装进系统；部分 Dock / shell 主题不读 SVG，
+  这些位图就是给它们用的。
+- `resources/variants/` 存着落选的两版（黑胶、音符）和旧的蓝色图标，想换风格直接覆盖正式稿再重跑打包。
+
 ## 目录结构
 
 ```
@@ -225,8 +243,9 @@ src/
     dialogs.rs  设置、歌词样式、在线匹配、手动编辑标签
     art.rs      封面圆角、模糊背景、主色提取（纯 CPU）
     theme.rs    CSS 变量表：浅/深色 + 强调色
-resources/      .desktop / 图标 / AppStream 元数据
+resources/      .desktop / 正式图标 + 小尺寸稿 + 各档 PNG / 落选方案 / AppStream 元数据
 build-deb.sh    dpkg-deb 打包脚本
+install-icon.sh 只装图标与 .desktop（开发运行时用）
 ```
 
 ## 一些实现上的取舍

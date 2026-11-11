@@ -71,7 +71,9 @@ fn main() {
 
     app.connect_activate(move |application| {
         guard::log("activate");
-        gtk::Window::set_default_icon_name("multimedia-audio-player");
+        // 窗口/Alt-Tab 的回退图标也用自家那一套（图标随 deb 装进 hicolor，
+        // 开发运行时由 install-icon.sh 装到用户级 hicolor）。
+        gtk::Window::set_default_icon_name(desktop::APP_ID);
         if let Some(existing) = application.active_window() {
             // 走到这里说明是「再点一次图标」：把已有窗口提到前面就行
             guard::log("已有窗口，present 后返回（没有新建实例）");
