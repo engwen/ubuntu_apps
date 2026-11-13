@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!--
+    OwlEditor 应用图标：蓝色圆角方形 + 白色大写字母 E（沿用此前用户认可的构图）。
+
+    设计约束（dock 栏图标显示要稳）：
+      * 全部使用 rect / path 等基础图元，不用 <use href>、<image>、
+        filter、mask 或外部字体 —— 任何 librsvg / GdkPixbuf / GNOME Shell
+        版本渲染结果都一致，也不会因缺字体而变成空白方块。
+      * 字母是「画」出来的路径，不是 <text>，因此不依赖系统里是否装了某款字体。
+      * 只用两个大色块（蓝底、白字），16px 缩小后仍清楚可辨。
+      * 形状为圆角方形（边角圆润），蓝色，整体比纯圆形更「方」。
+  -->
+  <defs>
+    <linearGradient id="disk" x1="0.12" y1="0" x2="0.86" y2="1">
+      <stop offset="0" stop-color="#4a9bf0"/>
+      <stop offset="0.5" stop-color="#1f66c9"/>
+      <stop offset="1" stop-color="#0f2f68"/>
+    </linearGradient>
+    <linearGradient id="letter" x1="0" y1="0" x2="0.25" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#d3dff1"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 蓝色圆角方形 -->
+  <rect x="18" y="18" width="220" height="220" rx="44" ry="44" fill="url(#disk)"/>
+  <rect x="24" y="24" width="208" height="208" rx="38" ry="38" fill="none"
+        stroke="#8fd0ff" stroke-opacity="0.35" stroke-width="6"/>
+
+  <!-- 大写 E：竖笔 32px，三横同厚，整体轻微右倾 -->
+  <g transform="translate(12,0) skewX(-6)">
+    <path d="M82 58 H178 V90 H114 V112 H160 V144 H114 V166 H178 V198 H82 Z"
+          fill="url(#letter)"/>
+  </g>
+</svg>

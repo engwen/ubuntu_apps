@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <!--
+    16/24 px 简化稿：与大图同一枚图标（蓝底圆角方形 + 白色大写 E），
+    去掉渐变与描边，字母略加粗，保证 dock / 任务栏小尺寸仍可辨认。
+  -->
+  <rect x="4" y="4" width="56" height="56" rx="11" ry="11" fill="#1f66c9"/>
+  <path d="M20.5 14.5 H44.5 V22.5 H28.5 V28 H40 V36 H28.5 V41.5 H44.5 V49.5 H20.5 Z"
+        fill="#ffffff"/>
+</svg>

@@ -1,0 +1,9 @@
+[package]
+name = "owl-core"
+version = "0.1.0"
+edition = "2021"
+description = "OwlEditor document kernel: bounded-memory chunked I/O, lazy line index, piece table"
+license = "MIT"
+
+[dependencies]
+memchr = "2"

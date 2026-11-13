@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=OwlEditor
+Name[zh_CN]=OwlEditor
+GenericName=Large File Text Editor
+GenericName[zh_CN]=大文件文本编辑器
+Comment=Wayland-native text editor for multi-gigabyte files
+Comment[zh_CN]=Wayland 原生、按需解析的 10 GiB+ 大文件文本编辑器
+Exec=owleditor %F
+Icon=io.github.owl.owleditor
+Terminal=false
+StartupNotify=true
+# Wayland 下 GNOME Shell 用窗口 app_id 匹配桌面项；XWayland / Ubuntu Dock
+# 还会用 WM_CLASS 兜底。缺这一行时 dock 认不出应用，会退回通用图标 +
+# argv[0] 名称（用户反馈「dock 栏图标不正确 / 名称不对」）。
+StartupWMClass=io.github.owl.owleditor
+Categories=Utility;TextEditor;
+MimeType=text/plain;text/x-log;text/csv;application/json;application/xml;
+Keywords=large;huge;log;editor;utf-8;wayland;ibus;rime;
