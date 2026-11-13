@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="10" y1="4" x2="118" y2="124" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2C356F"/>
+      <stop offset="0.55" stop-color="#171C48"/>
+      <stop offset="1" stop-color="#090C22"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.3" cy="0.2" r="0.8">
+      <stop offset="0" stop-color="#7E73E8" stop-opacity="0.32"/>
+      <stop offset="1" stop-color="#7E73E8" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="vinyl" cx="0.36" cy="0.28" r="0.85">
+      <stop offset="0" stop-color="#2A2C4E"/>
+      <stop offset="0.6" stop-color="#12142C"/>
+      <stop offset="1" stop-color="#080A1A"/>
+    </radialGradient>
+    <linearGradient id="rim" x1="20" y1="24" x2="106" y2="110" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFD694" stop-opacity="0.95"/>
+      <stop offset="0.5" stop-color="#9E86FF" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#6B5BE0" stop-opacity="0.15"/>
+    </linearGradient>
+    <linearGradient id="label" x1="48" y1="50" x2="80" y2="84" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFDE9B"/>
+      <stop offset="0.55" stop-color="#FFAE58"/>
+      <stop offset="1" stop-color="#EE7350"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="4" y="4" width="120" height="120" rx="30" fill="url(#bg)"/>
+  <rect x="4" y="4" width="120" height="120" rx="30" fill="url(#glow)"/>
+  <rect x="4.9" y="4.9" width="118.2" height="118.2" rx="29.1" fill="none"
+        stroke="#FFFFFF" stroke-opacity="0.13" stroke-width="1.8"/>
+
+  <!-- 黑胶 -->
+  <circle cx="61" cy="68" r="43" fill="url(#vinyl)"/>
+  <g fill="none" stroke="#CFC6FF">
+    <circle cx="61" cy="68" r="43" stroke="url(#rim)" stroke-width="2.2"/>
+    <circle cx="61" cy="68" r="37" stroke-opacity="0.10" stroke-width="1.2"/>
+    <circle cx="61" cy="68" r="32" stroke-opacity="0.08" stroke-width="1.2"/>
+    <circle cx="61" cy="68" r="27" stroke-opacity="0.07" stroke-width="1.2"/>
+    <circle cx="61" cy="68" r="22" stroke-opacity="0.06" stroke-width="1.2"/>
+  </g>
+  <!-- 斜掠过唱片的一道光 -->
+  <path d="M61 68 L98 31 A43 43 0 0 1 102 45 Z" fill="#FFFFFF" opacity="0.045"/>
+
+  <!-- 唱臂 -->
+  <path d="M105 24 L88 52" fill="none" stroke="#E3DCFF" stroke-width="4.2" stroke-linecap="round"/>
+  <circle cx="105" cy="24" r="5.2" fill="#E3DCFF"/>
+  <circle cx="88" cy="52" r="4.4" fill="#FFB865"/>
+
+  <!-- 中心标签：一只小小的猫头鹰 -->
+  <circle cx="61" cy="68" r="17" fill="url(#label)"/>
+  <circle cx="61" cy="68" r="14.2" fill="none" stroke="#FFFFFF" stroke-opacity="0.32" stroke-width="1"/>
+  <path d="M53 55 L53.5 47 L59 52.5 Z" fill="url(#label)"/>
+  <path d="M69 55 L68.5 47 L63 52.5 Z" fill="url(#label)"/>
+  <g fill="#2A1B3C">
+    <circle cx="55.5" cy="65" r="2.9"/>
+    <circle cx="66.5" cy="65" r="2.9"/>
+    <path d="M61 69.2 L63.4 72 L58.6 72 Z"/>
+  </g>
+  <circle cx="61" cy="78" r="1.7" fill="#2A1B3C" opacity="0.55"/>
+</svg>

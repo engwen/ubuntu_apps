@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="10" y1="6" x2="118" y2="122" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3A3F86"/>
+      <stop offset="0.55" stop-color="#20245C"/>
+      <stop offset="1" stop-color="#0C0E2C"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.4" cy="0.28" r="0.72">
+      <stop offset="0" stop-color="#9C86FF" stop-opacity="0.34"/>
+      <stop offset="0.62" stop-color="#6E5BE0" stop-opacity="0.07"/>
+      <stop offset="1" stop-color="#6E5BE0" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="note" x1="38" y1="24" x2="88" y2="104" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFEF8"/>
+      <stop offset="0.55" stop-color="#FBEFDB"/>
+      <stop offset="1" stop-color="#E2C8A4"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 夜色底板 -->
+  <rect x="4" y="4" width="120" height="120" rx="30" fill="url(#bg)"/>
+  <rect x="4" y="4" width="120" height="120" rx="30" fill="url(#glow)"/>
+  <rect x="4.9" y="4.9" width="118.2" height="118.2" rx="29.1" fill="none"
+        stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="1.8"/>
+
+  <!-- 斜置的八分音符 -->
+  <g transform="rotate(-18 64 64) translate(64 64) scale(1.06) translate(-64 -64)">
+    <!-- 符头 -->
+    <ellipse cx="50" cy="85" rx="18.5" ry="13.6" transform="rotate(-18 50 85)"
+             fill="url(#note)"/>
+    <!-- 符干 -->
+    <rect x="64.4" y="27" width="7.4" height="60" rx="3.7" fill="url(#note)"/>
+    <!-- 符尾 -->
+    <path d="M68 29.5 C88.5 33 95.5 50 81.5 65" fill="none"
+          stroke="url(#note)" stroke-width="7.2" stroke-linecap="round"/>
+  </g>
+</svg>

@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!--
+    小尺寸专用稿（16 / 24 / 32px 的位图由它渲染）。
+    和标准稿是同一只猫头鹰，但去掉星点、声波圆环、翅膀线、胸羽线和角落音符，
+    主体放大、闭眼弧加粗 —— 缩到 16px 时还能看出「闭着眼在听歌的猫头鹰」。
+  -->
+  <defs>
+    <linearGradient id="bg" x1="12" y1="6" x2="116" y2="122" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3B4394"/>
+      <stop offset="0.55" stop-color="#242A68"/>
+      <stop offset="1" stop-color="#101340"/>
+    </linearGradient>
+    <linearGradient id="body" x1="64" y1="32" x2="64" y2="104" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFDF6"/>
+      <stop offset="0.6" stop-color="#F8EFDE"/>
+      <stop offset="1" stop-color="#E5D0AF"/>
+    </linearGradient>
+    <linearGradient id="amber" x1="44" y1="58" x2="82" y2="88" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFDC8E"/>
+      <stop offset="1" stop-color="#FF9A46"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="4" y="4" width="120" height="120" rx="30" fill="url(#bg)"/>
+  <rect x="4.9" y="4.9" width="118.2" height="118.2" rx="29.1" fill="none"
+        stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="1.8"/>
+
+  <g transform="translate(64 66) scale(1.16) translate(-64 -66)">
+    <path d="M64 34 C74 34 83 38 88 46 L96 32 L95 55
+             C96 79 84 99 64 104 C44 99 32 79 33 55 L32 32 L40 46
+             C45 38 54 34 64 34 Z"
+          fill="url(#body)"/>
+
+    <circle cx="50.5" cy="62" r="14.4" fill="#1C1942"/>
+    <circle cx="77.5" cy="62" r="14.4" fill="#1C1942"/>
+
+    <g fill="none" stroke="url(#amber)" stroke-width="4.6" stroke-linecap="round">
+      <path d="M44.6 60.5 Q50.5 68 56.4 60.5"/>
+      <path d="M71.6 60.5 Q77.5 68 83.4 60.5"/>
+    </g>
+
+    <path d="M64 71 C67.4 71 69.6 73.2 69.6 76 C69.6 79.4 66.8 82.6 64 84.4
+             C61.2 82.6 58.4 79.4 58.4 76 C58.4 73.2 60.6 71 64 71 Z"
+          fill="url(#amber)"/>
+  </g>
+</svg>
