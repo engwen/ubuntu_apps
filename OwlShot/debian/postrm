@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+# 仅在 purge（彻底清除）时清理用户数据；普通 remove 保留，方便重装沿用设置。
+# config.toml / 历史目录是程序运行时生成的用户文件，不在 dpkg 安装清单里，
+# 必须在这里手动删，否则 purge 后仍会残留。
+if [ "$1" = "purge" ]; then
+    # postrm 以 root 运行，这里只清理触发安装/卸载的那个用户（$SUDO_USER）的目录，
+    # 不遍历 /home 下所有人，避免误删其他用户的配置。
+    if [ -n "$SUDO_USER" ]; then
+        user_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+        if [ -n "$user_home" ] && [ -d "$user_home" ]; then
+            rm -rf "$user_home/.config/owlshot"
+            rm -rf "$user_home/.local/share/owlshot"
+            printf '  OwlShot: 已清理 %s 的配置与历史目录\n' "$SUDO_USER"
+        fi
+    else
+        printf '  OwlShot: 未检测到 SUDO_USER，用户配置未自动清理。\n'
+        printf '  如需彻底删除，请手动执行：rm -rf ~/.config/owlshot ~/.local/share/owlshot\n'
+    fi
+fi

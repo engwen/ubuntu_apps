@@ -1,0 +1,49 @@
+owlshot (0.1.4) unstable; urgency=low
+
+  * 内置全局快捷键默认只注册「框选截图」（Ctrl+Shift+A）一个，
+    全屏（fullscreen）与贴图（paste）两项在配置模板中默认注释掉，
+    不再占用系统按键；用户可在 ~/.config/owlshot/config.toml 里
+    取消注释并自定义触发器，改完重启 owlshot 生效。
+  * 配置模板补充快捷键启用/修改与重启生效的详细说明。
+
+ -- engwen <engwen@localhost>  Fri, 10 Oct 2026 00:00:00 +0800
+
+owlshot (0.1.3-1) unstable; urgency=low
+
+  * 多屏扩展模式支持跨显示器截图：portal 返回的全桌面合并大图不再被
+    压缩到单屏显示，改为每块屏一个全屏无边框窗口，各自呈现属于自己的
+    物理切片，选区与标注可自由跨屏框选。
+  * 全局逻辑坐标系：选区、标注、手柄、工具栏全部使用跨屏全局坐标，
+    HiDPI 分数缩放下跨屏标注与底图保持对齐。
+  * 混合 DPI 多屏：按每屏各自缩放模型映射物理切片并校验；校验不通过
+    时退回统一缩放，保证不压缩不崩溃。
+  * 确认 / 取消时关闭全部屏上的编辑器窗口；单屏布局行为与旧版一致。
+
+ -- engwen <engwen@localhost>  Thu, 08 Oct 2026 00:00:00 +0800
+
+owlshot (0.1.2-1) unstable; urgency=low
+
+  * 适配 Ubuntu 26.04，同时保持 24.04 支持。
+  * Depends 下限修正为 libgtk-4-1 (>= 4.14)（编译启用 v4_14 feature 的诚实下限），
+    并显式声明 libc6 (>= 2.39)（rustc 1.98 std 的 pidfd 符号）。
+  * 双版本构建结论：24.04 / 26.04 任一端构建均可装两端（最高 GLIBC_2.39 = 24.04 的
+    glibc 版本；GTK4 只加符号不减，≤4.14 API 两端运行库都提供）。
+  * rustc 1.98 默认改用 rust-lld，不含 multiarch 目录，新增 .cargo/config.toml
+    补 -L/usr/lib/x86_64-linux-gnu。
+  * 26.04 的 xdg-desktop-portal-gnome 已带 GlobalShortcuts，运行时自动启用，无需改动。
+
+ -- engwen <engwen@localhost>  Fri, 02 Oct 2026 00:00:00 +0800
+
+owlshot (0.1.1-1) unstable; urgency=low
+
+  * Add "贴图" (pin) entry to tray right-click menu.
+
+ -- engwen <engwen@localhost>  Thu, 04 Sep 2026 00:00:00 +0800
+
+owlshot (0.1.0-1) unstable; urgency=low
+
+  * Initial release.
+  * Wayland 原生截图工具，基于 xdg-desktop-portal + GTK4 自绘标注编辑器。
+  * 支持矩形/椭圆/箭头/画笔/马赛克/文字标注、撤销、剪贴板与落盘。
+
+ -- engwen <engwen@localhost>  Wed, 03 Sep 2026 00:00:00 +0800
