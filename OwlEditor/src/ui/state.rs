@@ -115,6 +115,11 @@ pub struct AppState {
     /// 横向滚动条控件句柄：自动换行打开时隐藏（无横向溢出），关闭时显示。
     pub hscroll: Option<gtk::Scrollbar>,
     pub search_cancel: Option<Arc<AtomicBool>>,
+    /// 查找代数：每起一次新查找 +1。后台线程回传的结果只有在代数仍然
+    /// 匹配时才允许写进 `hits`，否则丢弃 —— 否则一个已被取消的旧查询
+    /// 晚一步返回，会把新查询的结果覆盖掉（甚至把旧偏移留在 `hits` 里，
+    /// 之后「替换」按过期偏移写文本就是改坏文件）。
+    pub search_gen: u64,
     pub index_cancel: Option<Arc<AtomicBool>>,
 
     /// 内容/光标变化后的统一刷新钩子（重绘 + 状态栏 + 滚动条 + 输入法光标）。
@@ -198,6 +203,7 @@ impl AppState {
             hadj: None,
             hscroll: None,
             search_cancel: None,
+            search_gen: 0,
             index_cancel: None,
             on_change: None,
             on_need_index: None,
@@ -470,6 +476,152 @@ impl AppState {
         self.view_dirty = true;
     }
 
+    /// 鼠标单击 / 双击 / 三击的选择策略。
+    ///
+    /// 判定放在状态层（不碰 GTK），这样能脱离显示后端做确定性回归：
+    /// - 单击（n_press 1）：光标落到 `caret`，清掉选区
+    /// - 双击（n_press 2）且指针压着单词字符：选中该词
+    /// - 双击（n_press 2）且指针压在非单词位置（行内空格、半角标点、空白行、行末空白）：整行
+    /// - 三击及以上（n_press ≥ 3）：整行，无条件
+    ///
+    /// 三击与双击是**两条独立分支**，只由连击次数决定，不看「当前选区是什么」。
+    /// 早先的实现里靠 `selection_range() == Some(word)` 来识别「同一个词的第二次双击」，
+    /// 结果慢速连点两次也会变成整行，而且和双击选词的语义纠缠在一起，没法单独调。
+    ///
+    /// `caret` 与 `over_char` 是两个不同口径（见 view.rs 的 `ClickHit`）：
+    /// 选词必须看「指针压着哪个字符」，不能看光标落点 —— 点在词后空格的左半边
+    /// 和点在词的右半边是同一个字节，只看光标会把前一个词选中。
+    pub fn select_by_click(&mut self, caret: u64, over_char: Option<u64>, n_press: i32) {
+        // 三击选行：连击次数说了算，与「压着的字符是什么」无关。
+        if n_press >= 3 {
+            let (a, b) = self.line_span_at(caret);
+            self.sel_anchor = Some(a);
+            self.cursor = b;
+            self.view_dirty = true;
+            return;
+        }
+        // 双击：压着单词就选词，压在空白 / 标点上（没压到字符）就整行。
+        if n_press == 2 {
+            let word = match over_char {
+                Some(c) => self.word_span_at(c),
+                None => (caret, caret),
+            };
+            let (a, b) = if word.0 >= word.1 {
+                self.line_span_at(caret)
+            } else {
+                word
+            };
+            self.sel_anchor = Some(a);
+            self.cursor = b;
+            self.view_dirty = true;
+            return;
+        }
+        // 单击：纯定位，不留选区。
+        self.sel_anchor = Some(caret);
+        self.cursor = caret;
+        self.view_dirty = true;
+    }
+
+    /// `byte` 所**指向的那个字符**所在的「单词」范围：向左右扩展到非单词字符为止。
+    /// 多字节字符（中文等）一律算单词字符 —— 没有分词器，至少不要把汉字切开。
+    /// `byte` 处的字符本身不是单词字符时返回空区间（`a == b`），
+    /// 由调用方决定退化成什么（双击 → 整行）。
+    ///
+    /// 读窗口是逐步扩张的：初始 512 字节，一旦扫到窗口边界（说明单词比窗口还长，
+    /// 或者底层读取被截短了）就按 8 倍继续扩，最多 1 MiB。少了这层，
+    /// 超长标识符 / 恰好被短读截断时会只选中一侧，看着像「只选到指针位置」。
+    pub fn word_span_at(&mut self, byte: u64) -> (u64, u64) {
+        let len = self.len();
+        let byte = byte.min(len);
+        let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
+        let mut back = 256u64;
+        let mut fwd = 256u64;
+        loop {
+            let from = byte.saturating_sub(back);
+            let to = (byte + fwd).min(len);
+            let data = self
+                .doc
+                .as_mut()
+                .map(|d| d.read_range(from, (to - from) as usize))
+                .unwrap_or_default();
+            let rel = (byte - from) as usize;
+            // 先确认「压着的这个字符」是单词字符。少了这一步，点空格会沿着
+            // `data[rel - 1]` 一路往左走，把前一个单词整块选中。
+            if rel >= data.len() || !is_word(data[rel]) {
+                return (byte, byte);
+            }
+            let mut a = rel;
+            let mut b = rel;
+            while a > 0 && is_word(data[a - 1]) {
+                a -= 1;
+            }
+            while b < data.len() && is_word(data[b]) {
+                b += 1;
+            }
+            // 扫到窗口边界 = 结果可能是被窗口截断的，继续扩窗口重扫。
+            let clipped_left = a == 0 && from > 0;
+            let clipped_right = b >= data.len() && from + (data.len() as u64) < len;
+            if (!clipped_left && !clipped_right) || back >= 1 << 20 {
+                return (from + a as u64, from + b as u64);
+            }
+            back = (back * 8).min(1 << 20);
+            fwd = (fwd * 8).min(1 << 20);
+        }
+    }
+
+    /// 落点所在的整行：[行首, 下一行行首)，**含**行尾换行符（最后一行无换行则到文件尾）。
+    /// 含换行是为了「选中整行后一按 Delete 就删掉这一行」，与 Kate / VS Code 一致。
+    ///
+    /// 不用 `byte_of_line`：那是行索引口径，大文件索引还没建完时给的是估算值，
+    /// 会选走一大段不相干的内容。这里直接扫真实字节，窗口不够就按 8 倍扩张。
+    pub fn line_span_at(&mut self, byte: u64) -> (u64, u64) {
+        let len = self.len();
+        let byte = byte.min(len);
+        let Some(doc) = self.doc.as_mut() else {
+            return (byte, byte);
+        };
+
+        // 向前找最近的 '\n'
+        let mut window = 4096u64;
+        let start = loop {
+            let from = byte.saturating_sub(window);
+            let mut buf = vec![0u8; (byte - from) as usize];
+            let n = doc.read_at(from, &mut buf);
+            buf.truncate(n);
+            match buf.iter().rposition(|&b| b == b'\n') {
+                Some(i) => break from + i as u64 + 1,
+                None if from == 0 => break 0,
+                None => {
+                    window = window.saturating_mul(8);
+                    if window > 64 * 1024 * 1024 {
+                        break 0;
+                    }
+                }
+            }
+        };
+
+        // 向后找最近的 '\n'
+        let mut window = 4096u64;
+        let end = loop {
+            let take = len.saturating_sub(byte).min(window);
+            let mut buf = vec![0u8; take as usize];
+            let n = doc.read_at(byte, &mut buf);
+            buf.truncate(n);
+            match buf.iter().position(|&b| b == b'\n') {
+                Some(i) => break byte + i as u64 + 1,
+                None if byte + take >= len => break len,
+                None => {
+                    window = window.saturating_mul(8);
+                    if window > 64 * 1024 * 1024 {
+                        break len;
+                    }
+                }
+            }
+        };
+
+        (start.min(len), end.max(start).min(len))
+    }
+
     pub fn selected_text(&mut self) -> String {
         let Some((s, e)) = self.selection_range() else { return String::new(); };
         // 剪贴板不需要搬运 GB 级文本，超过 8 MiB 时截断。
@@ -498,6 +650,7 @@ impl AppState {
         self.sel_anchor = None;
         self.preedit.clear();
         self.preedit_cursor = 0;
+        self.invalidate_hits();
         self.view_dirty = true;
         self.ensure_cursor_visible();
     }
@@ -513,8 +666,22 @@ impl AppState {
         self.apply_index_edit(start, end, start, old_nl, 0);
         self.sel_anchor = None;
         self.preedit.clear();
+        self.invalidate_hits();
         self.view_dirty = true;
         self.ensure_cursor_visible();
+    }
+
+    /// 正文字节一旦变化，已有匹配的偏移就全部失效。
+    ///
+    /// 必须同时让代数 +1：在途的后台查找还在按旧内容算偏移，它晚一步回传的
+    /// 结果若被写进 `hits`，「替换」就会按过期偏移改写正文 —— 那是真的会改坏
+    /// 文件，而不只是高亮错位。
+    fn invalidate_hits(&mut self) {
+        self.search_gen = self.search_gen.wrapping_add(1);
+        if !self.hits.is_empty() {
+            self.hits.clear();
+            self.hit_index = 0;
+        }
     }
 
     /// 撤销 / 重做：与正常输入共用 `apply_index_edit()` 增量维护行索引。
@@ -1100,5 +1267,253 @@ pub fn human_size(n: u64) -> String {
         format!("{} {}", n, UNITS[i])
     } else {
         format!("{:.2} {}", v, UNITS[i])
+    }
+}
+
+#[cfg(test)]
+mod click_select_tests {
+    use super::*;
+
+    /// 造一份带真实文档的状态（untitled 是匿名 fd，不落盘）。
+    fn state_with(text: &str) -> AppState {
+        let mut st = AppState::new();
+        let mut doc = Document::untitled().expect("untitled buffer");
+        doc.replace(0, 0, text.as_bytes());
+        st.doc = Some(doc);
+        st.cursor = 0;
+        st.sel_anchor = None;
+        st
+    }
+
+    fn selected(st: &mut AppState) -> String {
+        st.selected_text()
+    }
+
+    const SAMPLE: &str = "foo bar baz\nsecond line\n\n   \nlast";
+
+    #[test]
+    fn single_click_puts_caret_and_clears_selection() {
+        let mut st = state_with(SAMPLE);
+        st.sel_anchor = Some(0);
+        st.cursor = 3;
+        st.select_by_click(5, Some(5), 1);
+        assert_eq!(st.selection_range(), None, "单击不留选区");
+        assert_eq!(st.cursor, 5);
+        assert_eq!(st.sel_anchor, Some(5));
+    }
+
+    #[test]
+    fn double_click_on_word_selects_that_word_only() {
+        let mut st = state_with(SAMPLE);
+        // "foo bar baz" 里 bar 的 a = 字节 5
+        st.select_by_click(5, Some(5), 2);
+        assert_eq!(selected(&mut st), "bar");
+        assert_eq!(st.selection_range(), Some((4, 7)), "只选单词，不带空格");
+    }
+
+    #[test]
+    fn double_click_on_last_char_right_half_still_selects_the_word() {
+        let mut st = state_with(SAMPLE);
+        // 点在 'o'（foo 末字）右半边：caret = 3（空格处），但指针压着的是 'o'
+        st.select_by_click(3, Some(2), 2);
+        assert_eq!(selected(&mut st), "foo", "光标在空格上也要按指针压着的字符选词");
+    }
+
+    #[test]
+    fn double_click_again_on_same_word_stays_on_the_word() {
+        let mut st = state_with(SAMPLE);
+        st.select_by_click(5, Some(5), 2);
+        assert_eq!(selected(&mut st), "bar");
+        // 慢速的第二次双击：GTK 会把 n_press 重新算成 2 —— 仍然只选词，
+        // 不能因为「这个词已经被选中」就升级成整行（那是三击的活）。
+        st.select_by_click(5, Some(5), 2);
+        assert_eq!(selected(&mut st), "bar", "两次双击不再等于选行");
+    }
+
+    #[test]
+    fn triple_click_selects_whole_line() {
+        let mut st = state_with(SAMPLE);
+        st.select_by_click(5, Some(5), 1);
+        st.select_by_click(5, Some(5), 2);
+        assert_eq!(selected(&mut st), "bar");
+        st.select_by_click(5, Some(5), 3);
+        assert_eq!(selected(&mut st), "foo bar baz\n", "第三下 → 整行，含行尾换行");
+        st.select_by_click(5, Some(5), 4);
+        assert_eq!(selected(&mut st), "foo bar baz\n", "第 4 下仍是整行，不能退回选词");
+    }
+
+    #[test]
+    fn triple_click_works_even_without_a_prior_double_click() {
+        // n_press 直接给 3（GTK 连击累加的结果），不依赖前面是否选过词。
+        let mut st = state_with(SAMPLE);
+        st.select_by_click(9, Some(9), 3); // baz
+        assert_eq!(selected(&mut st), "foo bar baz\n");
+    }
+
+    #[test]
+    fn triple_click_on_blank_area_still_selects_the_line() {
+        let mut st = state_with(SAMPLE);
+        st.select_by_click(3, Some(3), 3); // 词间空格
+        assert_eq!(selected(&mut st), "foo bar baz\n");
+    }
+
+    #[test]
+    fn triple_click_line_and_double_click_word_are_independent() {
+        // 三击选行之后再慢速双击同一个词：应回到「只选那个词」。
+        let mut st = state_with(SAMPLE);
+        st.select_by_click(5, Some(5), 3);
+        assert_eq!(selected(&mut st), "foo bar baz\n");
+        st.select_by_click(5, Some(5), 2);
+        assert_eq!(selected(&mut st), "bar", "两条判定互不记忆彼此的状态");
+    }
+
+    #[test]
+    fn double_click_on_space_selects_whole_line_immediately() {
+        let mut st = state_with(SAMPLE);
+        st.select_by_click(3, Some(3), 2);
+        assert_eq!(selected(&mut st), "foo bar baz\n", "指针停在词间空格上 → 整行");
+    }
+
+    #[test]
+    fn double_click_on_punctuation_selects_whole_line_immediately() {
+        let mut st = state_with("let x = foo(1);\nnext");
+        st.select_by_click(11, Some(11), 2); // '('
+        assert_eq!(selected(&mut st), "let x = foo(1);\n");
+    }
+
+    #[test]
+    fn double_click_on_blank_line_selects_the_newline() {
+        let mut st = state_with(SAMPLE);
+        let blank = SAMPLE.find("\n\n").unwrap() + 1;
+        st.select_by_click(blank as u64, Some(blank as u64), 2);
+        assert_eq!(selected(&mut st), "\n", "空白行整行就是那个换行符");
+    }
+
+    #[test]
+    fn double_click_past_line_end_selects_whole_line() {
+        let mut st = state_with(SAMPLE);
+        // 行末右侧空白：没有字符被压住
+        st.select_by_click(11, None, 2);
+        assert_eq!(selected(&mut st), "foo bar baz\n");
+    }
+
+    #[test]
+    fn whole_line_stops_at_file_end_without_newline() {
+        let mut st = state_with(SAMPLE);
+        let last = SAMPLE.len() as u64 - 2;
+        st.select_by_click(last, Some(last), 2);
+        assert_eq!(selected(&mut st), "last", "最后一行没有换行就不能多选");
+    }
+
+    #[test]
+    fn double_click_on_adjacent_word_does_not_promote() {
+        let mut st = state_with(SAMPLE);
+        st.select_by_click(5, Some(5), 2);
+        assert_eq!(selected(&mut st), "bar");
+        st.select_by_click(9, Some(9), 2); // baz
+        assert_eq!(selected(&mut st), "baz", "换一个词双击，仍应只选那个词");
+    }
+
+    #[test]
+    fn cjk_run_is_treated_as_one_word() {
+        let mut st = state_with("这是 中文词 测试");
+        let byte = "这是 ".len() as u64 + 1;
+        st.select_by_click(byte, Some(byte), 2);
+        assert_eq!(selected(&mut st), "中文词");
+    }
+
+    #[test]
+    fn word_span_expands_past_the_first_read_window() {
+        // 一条 3000 字节的标识符：初始 512 字节的读窗口左右都不够，必须继续扩，
+        // 否则只会选到「词首→指针」这半截（用户截图里的现象）。
+        let word = "Z".repeat(3000);
+        let text = format!("pre {word} post\n");
+        let mut st = state_with(&text);
+        assert_eq!(st.word_span_at(4 + 1500), (4, 3004));
+    }
+
+    #[test]
+    fn word_span_is_empty_on_non_word_char() {
+        let mut st = state_with(SAMPLE);
+        assert_eq!(st.word_span_at(3), (3, 3), "空格不属于任何单词");
+    }
+
+    #[test]
+    fn line_span_expands_past_the_first_read_window() {
+        // 一条 10000 字节的长行：4096 的初始扫描窗口不够，必须继续扩张。
+        let long = "a".repeat(10_000);
+        let text = format!("{long}\nsecond");
+        let mut st = state_with(&text);
+        assert_eq!(st.line_span_at(5_000), (0, 10_001));
+        assert_eq!(st.line_span_at(10_500), (10_001, text.len() as u64));
+    }
+
+    #[test]
+    fn empty_document_click_is_harmless() {
+        let mut st = state_with("");
+        st.select_by_click(0, Some(0), 2);
+        assert_eq!(st.selection_range(), None);
+        assert_eq!(st.cursor, 0);
+    }
+}
+
+#[cfg(test)]
+mod search_invalidation_tests {
+    use super::*;
+
+    fn state_with(text: &str) -> AppState {
+        let mut st = AppState::new();
+        let mut doc = Document::untitled().expect("untitled buffer");
+        doc.replace(0, 0, text.as_bytes());
+        st.doc = Some(doc);
+        st
+    }
+
+    fn seed_hits(st: &mut AppState) {
+        st.hits = vec![
+            Hit { start: 0, end: 3 },
+            Hit { start: 4, end: 7 },
+        ];
+        st.hit_index = 1;
+        st.search_gen = 7;
+    }
+
+    #[test]
+    fn typing_invalidates_hits_and_search_generation() {
+        let mut st = state_with("foo bar");
+        seed_hits(&mut st);
+        st.cursor = 0;
+        st.insert_text("x");
+        assert!(st.hits.is_empty(), "正文变了，旧匹配偏移必须作废");
+        assert_eq!(st.hit_index, 0);
+        assert_eq!(st.search_gen, 8, "代数 +1，让在途查找到的结果被丢弃");
+    }
+
+    #[test]
+    fn deleting_invalidates_hits_and_search_generation() {
+        let mut st = state_with("foo bar");
+        seed_hits(&mut st);
+        st.delete_range(0, 1);
+        assert!(st.hits.is_empty());
+        assert_eq!(st.search_gen, 8);
+    }
+
+    #[test]
+    fn read_only_edit_keeps_hits() {
+        let mut st = state_with("foo bar");
+        seed_hits(&mut st);
+        st.read_only = true;
+        st.insert_text("x");
+        assert_eq!(st.hits.len(), 2, "只读模式没改正文，匹配结果应当保留");
+        assert_eq!(st.search_gen, 7);
+    }
+
+    #[test]
+    fn empty_insert_still_bumps_generation_only_when_no_text() {
+        let mut st = state_with("foo bar");
+        seed_hits(&mut st);
+        st.insert_text("");
+        assert_eq!(st.hits.len(), 2, "空插入不改正文，不应清掉匹配");
+        assert_eq!(st.search_gen, 7);
     }
 }

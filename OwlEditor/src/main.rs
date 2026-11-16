@@ -20,6 +20,8 @@
 //!   → `src/ui/window.rs`（GMenu + GAction + GtkPopoverMenuBar）
 //! * 一窗多标签 / 未命名缓冲区 / 各标签独立的查找栏与滚动条
 //!   → `src/ui/tab.rs`
+//! * 退出时记住还开着的标签页，下次启动按原顺序重新打开
+//!   → `src/ui/session.rs`（`$XDG_CONFIG_HOME/owleditor/session.txt`）
 //! * 虚拟自绘视图、双向滚动、自动换行、选区
 //!   → `src/ui/view.rs`、`src/ui/state.rs`
 //! * 全窗口统一配色

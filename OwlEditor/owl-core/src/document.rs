@@ -461,11 +461,15 @@ impl Document {
 
     /// 流式写出到目标路径（临时文件 + rename），**不改动** `path` / `dirty`。
     fn write_atomic(&mut self, target: &Path) -> io::Result<u64> {
-        let name = target
+        // 目标可能是符号链接（很常见：dotfiles 链接到家目录）。直接 rename 到
+        // 链接路径会**把链接本身替换成普通文件**，用户原来的软链就丢了。
+        // 先解析到真实文件再写；解析失败（新文件）就按原路径来。
+        let real = target.canonicalize().unwrap_or_else(|_| target.to_path_buf());
+        let name = real
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "untitled".into());
-        let tmp = target.with_file_name(format!(
+        let tmp = real.with_file_name(format!(
             ".{}.owleditor-{}.tmp",
             name,
             std::process::id()
@@ -486,7 +490,12 @@ impl Document {
             out.flush()?;
             out.sync_all()?;
             drop(out);
-            fs::rename(&tmp, target)?;
+            // 保留原文件权限：临时文件按 umask 建成 0644，直接换上去会把
+            // 0600/0755 之类的权限悄悄放宽或改掉。
+            if let Ok(meta) = fs::metadata(&real) {
+                let _ = fs::set_permissions(&tmp, meta.permissions());
+            }
+            fs::rename(&tmp, &real)?;
             Ok(())
         })();
         if result.is_err() {
@@ -697,6 +706,47 @@ mod tests {
         doc.undo();
         assert_eq!(doc.read_range(0, 14), b"one\ntwo\nthree\n");
         fs::remove_file(&path).unwrap();
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn save_keeps_original_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("owleditor-core-mode-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret.txt");
+        fs::write(&path, b"hello\n").unwrap();
+        // 0600：只有自己能读。保存后不能被临时文件的默认 0644 顶掉。
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut doc = Document::open(&path).unwrap();
+        doc.replace(0, 5, b"HELLO");
+        doc.save().unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "保存后权限必须保持 0600，不能放宽成 0644");
+        fs::remove_file(&path).unwrap();
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn save_through_symlink_keeps_the_link() {
+        let dir = std::env::temp_dir().join(format!("owleditor-core-link-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.txt");
+        let link = dir.join("link.txt");
+        fs::write(&real, b"hello\n").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut doc = Document::open(&link).unwrap();
+        doc.replace(0, 5, b"HELLO");
+        doc.save().unwrap();
+
+        let meta = fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_symlink(), "保存后链接本身必须还在");
+        assert_eq!(fs::read(&real).unwrap(), b"HELLO\n", "内容应写进链接指向的真实文件");
+        fs::remove_file(&link).unwrap();
+        fs::remove_file(&real).unwrap();
         let _ = fs::remove_dir(&dir);
     }
 }

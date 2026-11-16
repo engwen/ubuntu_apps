@@ -255,8 +255,22 @@ fn render(widget: &EditorView, snapshot: &gtk::Snapshot, state: &Shared) {
     drop(st);
 }
 
+/// 一次点击的两种口径。
+///
+/// - `caret`：光标应落到的字节位置（点在字符右半边、行末空白时右移一格）；
+/// - `over_char`：指针**正压着的那个字符**的起始字节，点在行末空白处为 `None`。
+///
+/// 双击选词必须用 `over_char`：用 `caret` 的话，「点在空格左半边」和
+/// 「点在它前面那个词的右半边」会得到同一个字节（都是空格的起始位置），
+/// 于是停在词后空格上双击也会把前一个词选中，而不是选中整行。
+#[derive(Clone, Copy)]
+struct ClickHit {
+    caret: u64,
+    over_char: Option<u64>,
+}
+
 /// 把窗口像素坐标换算成逻辑字节偏移。
-fn byte_at_point(widget: &EditorView, state: &Shared, x: f64, y: f64) -> Option<u64> {
+fn hit_at_point(widget: &EditorView, state: &Shared, x: f64, y: f64) -> Option<ClickHit> {
     let mut s = state.borrow_mut();
     s.refresh_view();
     let row_idx = (y / s.line_height as f64).max(0.0) as usize;
@@ -282,10 +296,23 @@ fn byte_at_point(widget: &EditorView, state: &Shared, x: f64, y: f64) -> Option<
     let text_px = layout.pixel_size().0 as f64 * pango::SCALE as f64;
     let past_end = px as f64 > text_px + pango::SCALE as f64 * 0.5;
     let mut idx = hit::hit_byte(display_text, index, trailing, past_end);
+    // `index` 与 trailing 无关，始终是命中字符的起始位置，正好就是
+    // 「指针压着的字符」。行末空白没有字符，记 None；`index` 已经等于
+    // 文本长度时同样表示「越过了最后一个字符」，也必须算 None —— 否则
+    // 双击行尾那一像素会把下一行开头的单词选走。
+    let mut over = if past_end || index.max(0) as usize >= display_text.len() {
+        None
+    } else {
+        Some(index.max(0) as usize)
+    };
     if let Some(c) = &composed {
         idx = c.from_layout_byte(idx);
+        over = over.map(|i| c.from_layout_byte(i));
     }
-    Some(row.byte_start + (idx as u64).min(row.byte_len))
+    Some(ClickHit {
+        caret: row.byte_start + (idx as u64).min(row.byte_len),
+        over_char: over.map(|i| row.byte_start + (i as u64).min(row.byte_len)),
+    })
 }
 
 /// 方向键/翻页键统一入口：Shift 时保留（或新建）选区锚点，非 Shift 时清除。
@@ -550,20 +577,20 @@ fn setup_controllers(widget: &EditorView, state: &Shared) {
     let s = state.clone();
     let view = widget.clone();
     let d1 = dragging.clone();
+    let origin = Rc::new(Cell::new((0.0f64, 0.0f64)));
+    let o1 = origin.clone();
+    let moved = Rc::new(Cell::new(false));
+    let m1 = moved.clone();
     click.connect_pressed(move |_, n_press, x, y| {
-        if let Some(byte) = byte_at_point(&view, &s, x, y) {
+        if let Some(hit) = hit_at_point(&view, &s, x, y) {
             with_state(&s, |st| {
-                if n_press == 2 {
-                    // 双击选词
-                    let (a, b) = word_at(st, byte);
-                    st.sel_anchor = Some(a);
-                    st.cursor = b;
-                } else {
-                    st.sel_anchor = Some(byte);
-                    st.cursor = byte;
-                }
+                // 单击定位 / 双击选词 / 再双击或非单词处双击选整行，
+                // 判定统一在 AppState::select_by_click 里。
+                st.select_by_click(hit.caret, hit.over_char, n_press);
                 st.view_dirty = true;
             });
+            o1.set((x, y));
+            m1.set(false);
             d1.set(true);
             view.grab_focus();
         }
@@ -575,13 +602,31 @@ fn setup_controllers(widget: &EditorView, state: &Shared) {
     let motion = gtk::EventControllerMotion::new();
     let s = state.clone();
     let view = widget.clone();
+    let m2 = moved.clone();
+    let o2 = origin.clone();
     motion.connect_motion(move |_, x, y| {
         if !dragging.get() {
             return;
         }
-        if let Some(byte) = byte_at_point(&view, &s, x, y) {
+        // 按下后先过「拖动阈值」再扩展选区。
+        //
+        // 少了这一步会出两个毛病（用户反馈「双击选词只选到指针位置」
+        // 「有时候还闪一下」）：双击的第一下把 dragging 置真、第二下选中
+        // 整个词，而这期间只要来一个 1 像素的抖动 motion，就会把 caret
+        // 写回指针处，选区立刻从「整个词」缩成「词首→指针」。
+        // 阈值取 4px，小于 GTK 判定双击允许的 5px，抖动不会误触发。
+        if !m2.get() {
+            let (ox, oy) = o2.get();
+            let dx = x - ox;
+            let dy = y - oy;
+            if dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD {
+                return;
+            }
+            m2.set(true);
+        }
+        if let Some(hit) = hit_at_point(&view, &s, x, y) {
             with_state(&s, |st| {
-                st.cursor = byte;
+                st.cursor = hit.caret;
                 st.view_dirty = true;
             });
         }
@@ -589,22 +634,9 @@ fn setup_controllers(widget: &EditorView, state: &Shared) {
     widget.add_controller(motion);
 }
 
-/// 双击选词：向左右扩展到非单词字符。
-fn word_at(st: &mut crate::ui::state::AppState, byte: u64) -> (u64, u64) {
-    let from = byte.saturating_sub(256);
-    let data = st.doc.as_mut().map(|d| d.read_range(from, 512)).unwrap_or_default();
-    let rel = (byte - from) as usize;
-    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
-    let mut a = rel.min(data.len());
-    let mut b = a;
-    while a > 0 && is_word(data[a - 1]) {
-        a -= 1;
-    }
-    while b < data.len() && is_word(data[b]) {
-        b += 1;
-    }
-    (from + a as u64, from + b as u64)
-}
+/// 按下后要移动多少像素才算「真的在拖」，低于此值一律当成手抖。
+/// 比 GTK 判定双击允许的位移（默认 5px）小一点，双击永远不会被抖动打断。
+const DRAG_THRESHOLD: f64 = 4.0;
 
 /// 供窗口层设置刷新钩子后做一次初始度量。
 pub fn initial_metrics(widget: &EditorView, state: &Shared) {

@@ -11,6 +11,7 @@
 //! 文件」历史在窗口之间共享。
 
 use crate::ui::recent::RecentFiles;
+use crate::ui::session::Session;
 use crate::ui::state::{APP_ID, APP_NAME};
 use crate::ui::tab::{self, Tab, TabEnv};
 use crate::ui::theme::{self, Theme};
@@ -106,6 +107,82 @@ fn recent_path() -> PathBuf {
     dir.push("owleditor");
     dir.push("recent.txt");
     dir
+}
+
+/// 会话（退出时还开着的标签页）的持久化位置：
+/// $XDG_CONFIG_HOME/owleditor/session.txt。
+fn session_path() -> PathBuf {
+    let mut dir = glib::user_config_dir();
+    dir.push("owleditor");
+    dir.push("session.txt");
+    dir
+}
+
+thread_local! {
+    /// 会话只在**第一次建窗口**时恢复。
+    ///
+    /// 少了这道闸，`new_window`（Ctrl+Shift+N）会每开一个窗口就把上次的
+    /// 一整排标签页再复制一份；而带文件名启动时也不该叠加上次的会话。
+    static SESSION_RESTORED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// 会话恢复的「一次性闸门」：只有本进程的第一个窗口有机会恢复。
+///
+/// 无论这次是恢复会话还是显式打开文件，都要把闸门消费掉 —— 否则
+/// 「用 owleditor file.txt 启动 → Ctrl+Shift+N 开新窗口」会把上次的一整排
+/// 标签页塞进这个新窗口里。
+fn take_session_slot() -> bool {
+    SESSION_RESTORED.with(|f| {
+        let was = f.get();
+        f.set(true);
+        !was
+    })
+}
+
+/// 读会话并剔除已丢失的文件；没有可恢复内容时返回 `None`。
+///
+/// 剔除结果会写回磁盘，避免陈旧条目一直累积。
+fn load_session() -> Option<Session> {
+    let mut s = Session::from_file(&session_path());
+    if s.is_empty() {
+        return None;
+    }
+    let lost = s.retain_existing();
+    if !lost.is_empty() {
+        let _ = s.save(&session_path());
+    }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// 把窗口当前开着的文件记成会话（标签页顺序 + 选中的下标）。
+///
+/// 只记有路径的标签页：未命名缓冲区没有落盘，重启后无法还原。
+/// 多窗口时以最后销毁的那个窗口为准 —— 恢复也只开一个窗口。
+fn save_session(w: &Win) {
+    // 用 active_tab() 而不是 notebook.current_page()：销毁过程中 notebook 的
+    // 页面可能已经开始拆，但「切页时记下的权威值」仍然有效。
+    let current = w.active_tab().map(|t| t.page.clone());
+    let mut paths = Vec::new();
+    let mut active = 0usize;
+    for t in w.tabs.borrow().iter() {
+        let path = { t.state.borrow().path.clone() };
+        if let Some(p) = path {
+            // 选中页的位置要按「有路径的标签页」重新数，否则前面若有未命名
+            // 缓冲区，恢复后就会停到相邻的那一页上。
+            if current.as_ref().map_or(false, |c| *c == t.page) {
+                active = paths.len();
+            }
+            paths.push(p);
+        }
+    }
+    let s = Session::with_paths(paths, active);
+    if let Err(e) = s.save(&session_path()) {
+        eprintln!("保存会话失败：{e}");
+    }
 }
 
 /// 用当前历史重建「打开最近文件」子菜单。空时放一个禁用占位项。
@@ -653,6 +730,8 @@ fn confirm_close_queue(w: &Rc<Win>, queue: Rc<RefCell<Vec<Rc<Tab>>>>, guard: Rc<
     };
     let Some(tab) = next else {
         guard.set(false);
+        // 未保存确认全部走完，真正关窗前再记一次会话。
+        save_session(w);
         w.window.destroy();
         return;
     };
@@ -915,11 +994,14 @@ pub fn open_window(app: &gtk::Application, files: Vec<PathBuf>) {
         let weak = Rc::downgrade(&win);
         // 用 WeakRef 引用窗口自身：闭包由窗口持有，捕获强引用会形成引用环。
         let gwin = window.downgrade();
-        window.connect_destroy(move |_| {
-            if let Some(w) = weak.upgrade() {
-                for t in w.tabs.borrow().iter() {
-                    t.dispose();
-                }
+    window.connect_destroy(move |_| {
+        if let Some(w) = weak.upgrade() {
+            // 会话在 close-request（或 confirm_close_queue 收尾）里已经存过，
+            // 这里只负责释放标签页 —— destroy 阶段 notebook 已在拆页面，
+            // 此时再算「当前是第几页」可能已经拿不到，会把选中页记错。
+            for t in w.tabs.borrow().iter() {
+                t.dispose();
+            }
                 w.tabs.borrow_mut().clear();
                 *w.active.borrow_mut() = None;
             }
@@ -948,6 +1030,9 @@ pub fn open_window(app: &gtk::Application, files: Vec<PathBuf>) {
                 .cloned()
                 .collect();
             if dirty.is_empty() {
+                // 关窗前先落盘会话：此刻 notebook 与标签页都还完整，
+                // 比等 destroy 阶段（页面已在拆）更可靠。
+                save_session(&w);
                 return glib::Propagation::Proceed;
             }
             guard.set(true);
@@ -978,12 +1063,31 @@ pub fn open_window(app: &gtk::Application, files: Vec<PathBuf>) {
 
     // ---------------------------------------------------------------- 启动
     window.present();
+    // 不带文件名启动 → 接着上次的会话，把当时还开着的文件全部重新打开。
+    // 命令行显式给了文件就按文件来，不再叠加上次的标签页；闸门照样消费掉，
+    // 这样之后新开的窗口不会再恢复一次。
+    let slot = take_session_slot();
+    let (files, restored_active) = if files.is_empty() && slot {
+        match load_session() {
+            Some(s) => (s.paths().to_vec(), Some(s.active())),
+            None => (Vec::new(), None),
+        }
+    } else {
+        (files, None)
+    };
     if files.is_empty() {
         let t = win.add_tab(None);
         t.focus();
     } else {
         for p in files {
             win.add_tab(Some(p));
+        }
+        // add_tab 会把每页都设成当前页，所以最后要手动回到退出时选中的那一页。
+        // set_current_page 会触发 switch-page，窗口的 active 缓存与标题随之更新。
+        if let Some(i) = restored_active {
+            if i < win.tabs.borrow().len() {
+                win.notebook.set_current_page(Some(i as u32));
+            }
         }
         if let Some(t) = win.active_tab() {
             t.focus();

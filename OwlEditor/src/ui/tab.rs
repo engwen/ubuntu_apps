@@ -837,20 +837,34 @@ pub fn build_tab(env: TabEnv, initial: Option<PathBuf>) -> Rc<Tab> {
         let state = state.clone();
         let hook = hook.clone();
         let case_check = case_check.clone();
-        let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        // 输入防抖只用一个「代际」计数器，**不再持有并 remove SourceId**。
+        //
+        // 旧写法把 timeout 的 SourceId 存下来，下次输入时 `id.remove()`。可这个
+        // 一次性超时一旦已经触发（停顿超过 220ms），GLib 就把源销毁了，再 remove
+        // 会返回失败并在 glib 内部 `unwrap` panic；而 panic 落在 GTK 信号回调这种
+        // 不能 unwind 的 ABI 边界上，直接 `panic in a function that cannot unwind`
+        // → **整个进程 abort**。表现就是「输入几个字符就闪退」：第一个字打完停顿
+        // 一下让超时跑掉，第二个字落地时就被 remove 打死了。
+        // 现在改成「谁最新谁有效」：每次输入让代数 +1，超时里发现代数变了就放弃。
+        let generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         find_entry.connect_search_changed(move |e| {
             let text = e.text().to_string();
-            if let Some(id) = pending.borrow_mut().take() {
-                id.remove();
-            }
+            let gen = generation.get().wrapping_add(1);
+            generation.set(gen);
             let s = state.clone();
             let h = hook.clone();
             let cs = case_check.is_active();
-            let id = glib::timeout_add_local_once(Duration::from_millis(220), move || {
+            let g = generation.clone();
+            glib::timeout_add_local_once(Duration::from_millis(220), move || {
+                if g.get() != gen {
+                    return; // 这 220ms 内又输入过，本次已作废
+                }
                 if let Some(line_no) = text.strip_prefix('#') {
                     if let Ok(n) = line_no.trim().parse::<u64>() {
                         with_state(&s, |st| {
                             st.jump_to_line(n.saturating_sub(1));
+                            // 跳行时丢掉在途查找的结果（代数 +1 让它作废）。
+                            st.search_gen = st.search_gen.wrapping_add(1);
                             st.hits.clear();
                             st.search_msg = format!("已跳到第 {} 行", n);
                             if !st.index_exact() {
@@ -863,7 +877,6 @@ pub fn build_tab(env: TabEnv, initial: Option<PathBuf>) -> Rc<Tab> {
                 }
                 start_search(&s, &h, text, cs);
             });
-            *pending.borrow_mut() = Some(id);
         });
     }
     {
@@ -914,6 +927,8 @@ pub fn build_tab(env: TabEnv, initial: Option<PathBuf>) -> Rc<Tab> {
                 s.cursor = h.end;
                 s.sel_anchor = Some(h.start);
                 s.insert_text(&text);
+                // 替换改动了正文，旧 hits 的偏移随即失效；代数 +1 丢掉在途结果。
+                s.search_gen = s.search_gen.wrapping_add(1);
                 s.hits.clear();
                 s.hit_index = 0;
                 s.message = "已替换 1 处".to_string();
@@ -935,6 +950,9 @@ pub fn build_tab(env: TabEnv, initial: Option<PathBuf>) -> Rc<Tab> {
                     s.message = "没有可替换的匹配".to_string();
                     return;
                 }
+                // 一旦改动文档，hits 里的偏移就全部作废：代数 +1 让在途查找的
+                // 回传结果作废，别让过期偏移在「再按一次替换」时写进正文。
+                s.search_gen = s.search_gen.wrapping_add(1);
                 if let Some(d) = s.doc.as_mut() {
                     // 从后往前替换，前面的偏移不受影响。
                     for h in hits.iter().rev() {
@@ -943,10 +961,20 @@ pub fn build_tab(env: TabEnv, initial: Option<PathBuf>) -> Rc<Tab> {
                 }
                 s.line_index = None;
                 s.revision += 1;
+                // 文档变短时光标/选区会落到正文之外，必须夹回长度内。
+                let len = s.doc.as_ref().map(|d| d.len()).unwrap_or(0);
+                if s.cursor > len {
+                    s.cursor = len;
+                }
+                s.sel_anchor = None;
                 s.view_dirty = true;
                 s.hits.clear();
                 s.hit_index = 0;
-                s.message = format!("已替换 {} 处（后台重建行索引中）", hits.len());
+                s.message = if hits.len() >= 500 {
+                    format!("已替换 {} 处（已达单次上限 500，可能还有更多匹配）", hits.len())
+                } else {
+                    format!("已替换 {} 处（后台重建行索引中）", hits.len())
+                };
             });
         });
     }
@@ -1339,11 +1367,15 @@ fn start_index(state: &Shared, hook: &Rc<dyn Fn()>, status: gtk::Label) {
 
 /// 后台流式查找：结果增量回传，随时可取消，内存恒定。
 fn start_search(state: &Shared, hook: &Rc<dyn Fn()>, query: String, case_sensitive: bool) {
-    {
+    let gen = {
         let mut s = state.borrow_mut();
         if let Some(c) = s.search_cancel.take() {
             c.store(true, Ordering::Relaxed);
         }
+        // 新查询开始：代数 +1。之前那次查找（哪怕已经被 cancel 打断）回传的
+        // 结果代数是旧的，下面一律丢弃 —— 否则旧结果会覆盖新结果，甚至在
+        // 「替换」时把过期偏移写进文档。
+        s.search_gen = s.search_gen.wrapping_add(1);
         s.search_query = query.clone();
         s.case_sensitive = case_sensitive;
         s.hits.clear();
@@ -1351,7 +1383,8 @@ fn start_search(state: &Shared, hook: &Rc<dyn Fn()>, query: String, case_sensiti
         if query.is_empty() {
             s.search_msg.clear();
         }
-    }
+        s.search_gen
+    };
     if query.is_empty() {
         hook();
         return;
@@ -1378,19 +1411,28 @@ fn start_search(state: &Shared, hook: &Rc<dyn Fn()>, query: String, case_sensiti
     glib::timeout_add_local(Duration::from_millis(16), move || {
         match rx.try_recv() {
             Ok(SearchMsg::Done(hits, outcome)) => {
-                with_state(&state, |s| {
-                    s.hits = hits;
-                    s.hit_index = 0;
-                    let base = if outcome.cancelled {
-                        "查找已取消".to_string()
+                // 代数不匹配 = 这批结果属于一个已经被取代的查询，直接丢掉。
+                let applied = {
+                    let mut s = state.borrow_mut();
+                    if s.search_gen == gen {
+                        s.hits = hits;
+                        s.hit_index = 0;
+                        let base = if outcome.cancelled {
+                            "查找已取消".to_string()
+                        } else {
+                            format!("找到 {} 处（已扫描 {}）", s.hits.len(), human_size(outcome.scanned))
+                        };
+                        s.search_msg = base.clone();
+                        s.message = base;
+                        s.view_dirty = true;
+                        true
                     } else {
-                        format!("找到 {} 处（已扫描 {}）", s.hits.len(), human_size(outcome.scanned))
-                    };
-                    s.search_msg = base.clone();
-                    s.message = base;
-                    s.view_dirty = true;
-                });
-                hook();
+                        false
+                    }
+                };
+                if applied {
+                    hook();
+                }
                 glib::ControlFlow::Break
             }
             Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,

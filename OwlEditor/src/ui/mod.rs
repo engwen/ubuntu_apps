@@ -1,5 +1,6 @@
 pub mod ime;
 pub mod recent;
+pub mod session;
 pub mod state;
 pub mod tab;
 pub mod theme;
