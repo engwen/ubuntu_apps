@@ -189,7 +189,6 @@ fn desktop_entry(exe: &Path) -> String {
         "[Desktop Entry]
 Type=Application
 Name=OwlMusic
-Name[zh_CN]=OwlMusic 音乐
 GenericName=Music Player
 GenericName[zh_CN]=音乐播放器
 Comment=Local music player with lyrics and tag editing
@@ -252,6 +251,14 @@ mod tests {
     fn plain_path_is_not_quoted() {
         let s = desktop_entry(Path::new("/usr/bin/owlmusic"));
         assert!(s.contains("Exec=/usr/bin/owlmusic %F"));
+    }
+
+    /// 应用名只叫 OwlMusic：Dock 里显示成「OwlMusic 音乐」是因为多写了一行本地化名字。
+    #[test]
+    fn name_is_plain_owlmusic() {
+        let s = desktop_entry(Path::new("/usr/bin/owlmusic"));
+        assert!(s.contains("\nName=OwlMusic\n"), "Name 必须是 OwlMusic");
+        assert!(!s.contains("\nName[zh_CN]"), "不该再有本地化名字");
     }
 
     #[test]
