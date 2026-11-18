@@ -156,11 +156,55 @@ window.owleditor .owl-toolbar {{
   padding: 0 2px;
 }}
 window.owleditor .owl-toolbar separator {{ margin: 2px 3px; min-width: 1px; }}
-window.owleditor .owl-status {{
+window.owleditor .owl-statusbar {{
   background-color: @owl_chrome;
   border-top: 1px solid @owl_border;
-  color: @owl_dim;
   padding: 3px 10px;
+}}
+window.owleditor .owl-status {{
+  background-color: transparent;
+  color: @owl_dim;
+  padding: 0;
+}}
+/* 状态栏里的文件路径：看着像文字，但可点（弹「复制路径 / 打开所在文件夹」）。
+   必须显式清掉全局 button 的底色/边框，否则会变成一颗灰按钮。 */
+window.owleditor .owl-status-path {{
+  background-color: transparent;
+  background-image: none;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  box-shadow: none;
+  color: @owl_fg;
+  min-height: 0;
+  padding: 0 6px;
+}}
+window.owleditor .owl-status-path:hover {{
+  background-color: alpha(@owl_fg, 0.10);
+  border-color: @owl_border;
+}}
+window.owleditor .owl-status-path:active,
+window.owleditor .owl-status-path:checked {{
+  background-color: alpha(@owl_fg, 0.18);
+  border-color: @owl_border;
+}}
+window.owleditor .owl-status-path:disabled {{
+  color: @owl_dim;
+  background-color: transparent;
+}}
+window.owleditor .owl-status-menu {{
+  padding: 4px;
+}}
+window.owleditor .owl-status-menu-item {{
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  border-radius: 5px;
+  color: @owl_fg;
+  padding: 5px 12px;
+}}
+window.owleditor .owl-status-menu-item:hover {{
+  background-color: alpha(@owl_fg, 0.12);
 }}
 /* 查找/替换浮窗：叠在编辑区右上角的小卡片，不是压在正文上方的横栏。
    需要圆角 + 描边 + 阴影，让它和底下的正文明确分层。 */

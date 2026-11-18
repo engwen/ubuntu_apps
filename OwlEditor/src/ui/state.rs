@@ -120,6 +120,9 @@ pub struct AppState {
     /// 晚一步返回，会把新查询的结果覆盖掉（甚至把旧偏移留在 `hits` 里，
     /// 之后「替换」按过期偏移写文本就是改坏文件）。
     pub search_gen: u64,
+    /// 「已选 N 字」的缓存：(选区起点, 选区终点, 字数)。
+    /// 拖动选区时每一帧都会问一次字数，几十 MB 的选区不能每次重扫。
+    pub sel_char_cache: Option<(u64, u64, usize)>,
     pub index_cancel: Option<Arc<AtomicBool>>,
 
     /// 内容/光标变化后的统一刷新钩子（重绘 + 状态栏 + 滚动条 + 输入法光标）。
@@ -204,6 +207,7 @@ impl AppState {
             hscroll: None,
             search_cancel: None,
             search_gen: 0,
+            sel_char_cache: None,
             index_cancel: None,
             on_change: None,
             on_need_index: None,
@@ -1047,14 +1051,11 @@ impl AppState {
         (x, y)
     }
 
-    pub fn status_text(&mut self) -> String {
-        let stats = self.doc.as_ref().map(|d| d.stats());
-        let line = self.line_of_byte(self.cursor) + 1;
-        let col = self.cursor_display_col() + 1;
-        let total = self.total_lines();
-        let sel = self.selection_range().map(|(a, b)| b - a).unwrap_or(0);
-        let mut parts: Vec<String> = Vec::new();
-        // 文件名放最前：一窗多标签时状态栏必须能看出「现在编辑的是谁」。
+    /// 状态栏最左侧显示的路径文字。
+    ///
+    /// 只留「上级目录/文件名」，避免长路径把后面各项挤出可视区；
+    /// 完整路径由这个按钮的 tooltip 与菜单里的「复制完整路径」提供。
+    pub fn path_display(&self) -> String {
         match &self.path {
             Some(p) => {
                 let raw = p.as_os_str().len();
@@ -1062,7 +1063,6 @@ impl AppState {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| p.display().to_string());
-                // 路径太长时只留文件名 + 上级目录，避免把后面各项挤出去。
                 if raw > 0 && name.len() + 1 < raw {
                     let parent = p
                         .parent()
@@ -1070,20 +1070,39 @@ impl AppState {
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     if parent.is_empty() {
-                        parts.push(name);
+                        name
                     } else {
-                        parts.push(format!("{parent}/{name}"));
+                        format!("{parent}/{name}")
                     }
                 } else {
-                    parts.push(name);
+                    name
                 }
             }
-            None => parts.push("未命名".to_string()),
+            None => "未命名".to_string(),
         }
-        parts.push(format!("行 {} / {}，列 {}", line, total, col));
-        if sel > 0 {
-            parts.push(format!("已选 {} 字节", sel));
+    }
+
+    /// 状态栏最右侧（钉在末尾、不参与省略）：所在行/列 + 已选字数。
+    ///
+    /// 用户 2026-11-16 要求：行/列与选区计数放到状态栏最末，
+    /// 且「已选」的单位从字节改成字数（字符数）。
+    pub fn status_pos_text(&mut self) -> String {
+        let line = self.line_of_byte(self.cursor) + 1;
+        let col = self.cursor_display_col() + 1;
+        let total = self.total_lines();
+        let mut text = format!("行 {} / {}，列 {}", line, total, col);
+        let chars = self.selection_chars();
+        if chars > 0 {
+            text.push_str(&format!("   │   已选 {} 字", chars));
         }
+        text
+    }
+
+    /// 状态栏中段：尺寸、内存、编码、换行符、缩放、各种标志与提示消息。
+    /// 窗口变窄时这一段先省略，路径与行/列都不受影响。
+    pub fn status_info_text(&mut self) -> String {
+        let stats = self.doc.as_ref().map(|d| d.stats());
+        let mut parts: Vec<String> = Vec::new();
         if let Some(s) = &stats {
             parts.push(human_size(s.logical_len));
             parts.push(format!("内存 ≤ {:.1} MiB", s.heap_upper_bound as f64 / 1048576.0));
@@ -1113,6 +1132,38 @@ impl AppState {
         } else {
             format!("{}   │   {}", base, self.message)
         }
+    }
+
+    /// 当前选区的字符数（不是字节数）。
+    ///
+    /// 按 UTF-8 首字节计数（非 `10xxxxxx` 的字节就是一个字符的起点），
+    /// 这样不必解码、也不必把整段选区读进内存。结果按 `(start, end)`
+    /// 缓存：拖动选区时每帧都会问一次，几十 MB 的选区不能每次重扫。
+    pub fn selection_chars(&mut self) -> usize {
+        let Some((a, b)) = self.selection_range() else {
+            self.sel_char_cache = None;
+            return 0;
+        };
+        if let Some((ca, cb, n)) = self.sel_char_cache {
+            if ca == a && cb == b {
+                return n;
+            }
+        }
+        let Some(doc) = self.doc.as_mut() else { return 0 };
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut off = a;
+        let mut chars = 0usize;
+        while off < b {
+            let got = doc.read_at(off, &mut buf);
+            if got == 0 {
+                break;
+            }
+            let take = (got as u64).min(b - off) as usize;
+            chars += buf[..take].iter().filter(|c| (**c & 0xC0) != 0x80).count();
+            off += take as u64;
+        }
+        self.sel_char_cache = Some((a, b, chars));
+        chars
     }
 
     /// 输入法索取光标上下文。
@@ -1515,5 +1566,102 @@ mod search_invalidation_tests {
         st.insert_text("");
         assert_eq!(st.hits.len(), 2, "空插入不改正文，不应清掉匹配");
         assert_eq!(st.search_gen, 7);
+    }
+}
+
+#[cfg(test)]
+mod status_bar_tests {
+    use super::*;
+
+    fn state_with(text: &str) -> AppState {
+        let mut st = AppState::new();
+        let mut doc = Document::untitled().expect("untitled buffer");
+        doc.replace(0, 0, text.as_bytes());
+        st.doc = Some(doc);
+        st
+    }
+
+    #[test]
+    fn selection_counts_characters_not_bytes() {
+        let mut st = state_with("中文 test");
+        st.select_all();
+        // 7 个字符 / 11 个字节：用户要的是字数。
+        assert_eq!(st.selection_chars(), 7);
+        assert_eq!(st.selection_range().map(|(a, b)| (b - a) as usize), Some(11));
+    }
+
+    #[test]
+    fn selection_chars_zero_without_selection() {
+        let mut st = state_with("中文 test");
+        st.cursor = 3;
+        st.sel_anchor = None;
+        assert_eq!(st.selection_chars(), 0);
+    }
+
+    #[test]
+    fn selection_chars_survives_chunk_boundary() {
+        // 300 000 字节 > 一次读取的 256 KiB 窗口，必须跨块累加，
+        // 且多字节字符不能被拆成两半算成两个「字」。
+        let text = format!("{}{}", "a".repeat(300_000), "中文".repeat(5));
+        let mut st = state_with(&text);
+        st.select_all();
+        assert_eq!(st.selection_chars(), 300_010);
+    }
+
+    #[test]
+    fn selection_chars_cached_per_span() {
+        let mut st = state_with("alpha beta gamma");
+        st.sel_anchor = Some(0);
+        st.cursor = 5;
+        assert_eq!(st.selection_chars(), 5);
+        assert_eq!(st.sel_char_cache.map(|(a, b, n)| n), Some(5));
+        // 选区变了必须重算，不能拿旧缓存。
+        st.cursor = 10;
+        assert_eq!(st.selection_chars(), 10);
+    }
+
+    #[test]
+    fn pos_text_carries_line_column_and_char_count() {
+        let mut st = state_with("foo bar\nbaz");
+        st.cursor = 9;
+        st.sel_anchor = Some(8);
+        let text = st.status_pos_text();
+        // 形如「行 L / T，列 C   │   已选 N 字」：行/列在前、选区计数紧随其后，
+        // 且单位是「字」而不是字节（8..9 是 'b'，1 个字 / 1 个字节）。
+        assert!(text.starts_with("行 "), "行/列在最右段：{text}");
+        assert!(text.contains("，列 "), "{text}");
+        assert!(text.contains("   │   已选 1 字"), "单位是字不是字节：{text}");
+        assert_eq!(st.selection_chars(), 1);
+    }
+
+    #[test]
+    fn pos_text_omits_selection_when_empty() {
+        let mut st = state_with("foo");
+        st.sel_anchor = None;
+        let text = st.status_pos_text();
+        assert!(!text.contains("已选"), "没有选区时不显示已选：{text}");
+    }
+
+    #[test]
+    fn info_text_no_longer_holds_line_position() {
+        let mut st = state_with("foo\nbar");
+        let info = st.status_info_text();
+        assert!(!info.contains("，列 "), "行/列必须已经从中间段移走：{info}");
+        assert!(!info.contains("已选"), "选区计数必须已经从中间段移走：{info}");
+        assert!(
+            info.contains("已保存") || info.contains("未保存（未命名）") || info.contains("已修改"),
+            "{info}"
+        );
+    }
+
+    #[test]
+    fn path_display_shortens_to_parent_and_name() {
+        let mut st = state_with("x");
+        st.path = Some(std::path::PathBuf::from("/home/engwen/下载/deep/note.txt"));
+        assert_eq!(st.path_display(), "deep/note.txt");
+        st.path = Some(std::path::PathBuf::from("/note.txt"));
+        assert_eq!(st.path_display(), "note.txt");
+        st.path = None;
+        assert_eq!(st.path_display(), "未命名");
     }
 }

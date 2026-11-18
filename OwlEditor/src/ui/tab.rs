@@ -175,6 +175,85 @@ fn find_tool_button(icon: &str, tip: &str) -> gtk::Button {
     b
 }
 
+/// 状态栏的三段式布局。
+///
+/// 早期是一个 `GtkLabel`，所有信息拼成一行字符串，靠省略号截断。问题是：
+/// 窗口一窄就先丢掉最后的行号/列号，而且路径只是一段不可交互的死文本。
+/// 现在拆成「路径按钮 + 中段指标 + 右侧行/列」三个控件：
+/// - 路径按钮可点，弹出「复制完整路径 / 复制文件名 / 打开所在文件夹」；
+/// - 中段（尺寸/内存/编码/换行符/缩放/状态/提示）会被压缩并省略；
+/// - 行/列与已选字数钉在最右，永远不参与省略。
+#[derive(Clone)]
+pub struct StatusBar {
+    pub row: gtk::Box,
+    pub path_btn: gtk::Button,
+    pub path_label: gtk::Label,
+    pub info: gtk::Label,
+    pub pos: gtk::Label,
+}
+
+/// 把当前状态刷进状态栏三个控件。所有刷新路径（hook / 轻量刷新 / 索引进度）共用。
+fn apply_status(state: &Shared, bar: &StatusBar) {
+    let (path, info, pos, full) = {
+        let mut s = state.borrow_mut();
+        (
+            s.path_display(),
+            s.status_info_text(),
+            s.status_pos_text(),
+            s.path.as_ref().map(|p| p.display().to_string()),
+        )
+    };
+    bar.path_label.set_label(&path);
+    bar.info.set_label(&info);
+    bar.pos.set_label(&pos);
+    // 路径可能因为「另存为」而变，按钮的提示与可用性跟着走。
+    // 状态栏每帧都刷，提示文本一样时不要重复 set（否则每帧重建一次 tooltip）。
+    let tip = match &full {
+        Some(p) => format!("{p}\n点按：复制路径 / 打开所在文件夹"),
+        None => "未命名缓冲区：保存后才有路径".to_string(),
+    };
+    if bar.path_btn.tooltip_text().as_deref() != Some(tip.as_str()) {
+        bar.path_btn.set_tooltip_text(Some(&tip));
+    }
+    if bar.path_btn.is_sensitive() != full.is_some() {
+        bar.path_btn.set_sensitive(full.is_some());
+    }
+}
+
+/// 状态栏路径菜单里的一项：扁平、左对齐，看起来像菜单项而不是普通按钮。
+fn status_menu_item(label: &str) -> gtk::Button {
+    let b = gtk::Button::with_label(label);
+    b.add_css_class("owl-status-menu-item");
+    b.set_halign(gtk::Align::Fill);
+    if let Some(l) = b.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
+        l.set_xalign(0.0);
+    }
+    b
+}
+
+/// 复制文本到剪贴板。拿不到显示后端时静默失败（不让回调里 panic）。
+fn copy_to_clipboard(text: &str) -> bool {
+    match gtk::gdk::Display::default() {
+        Some(d) => {
+            d.clipboard().set_text(text);
+            true
+        }
+        None => false,
+    }
+}
+
+/// 用默认文件管理器打开目录。返回错误文案，成功则返回 `None`。
+fn open_containing_dir(dir: &Path) -> Option<String> {
+    let uri = match glib::filename_to_uri(dir, None::<&str>) {
+        Ok(u) => u,
+        Err(e) => return Some(format!("路径无法转成 URI: {e}")),
+    };
+    match gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>) {
+        Ok(()) => None,
+        Err(e) => Some(format!("无法打开所在文件夹: {e}")),
+    }
+}
+
 pub fn build_tab(env: TabEnv, initial: Option<PathBuf>) -> Rc<Tab> {
     let state: Shared = Rc::new(RefCell::new(AppState::new()));
     let view = EditorView::new(&state);
@@ -323,15 +402,126 @@ pub fn build_tab(env: TabEnv, initial: Option<PathBuf>) -> Rc<Tab> {
     content_box.append(&hscroll);
 
     // ---------------------------------------------------------------- 状态栏
-    let status = gtk::Label::new(Some("就绪"));
-    status.set_xalign(0.0);
-    status.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    status.add_css_class("monospace");
-    status.add_css_class("owl-status");
-    status.set_margin_start(10);
-    status.set_margin_end(10);
-    status.set_margin_top(4);
-    status.set_margin_bottom(4);
+    let status_path_label = gtk::Label::new(Some("未命名"));
+    status_path_label.set_xalign(0.0);
+    status_path_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    // 不 hexpand 的 Label 会拿到「自然宽度」，长路径会把中间段全挤掉；
+    // 限一个字符数上限，省略号才真的会生效。
+    status_path_label.set_max_width_chars(48);
+    status_path_label.add_css_class("monospace");
+    let status_path = gtk::Button::new();
+    status_path.add_css_class("owl-status-path");
+    status_path.set_halign(gtk::Align::Start);
+    status_path.set_child(Some(&status_path_label));
+
+    let status_info = gtk::Label::new(Some("就绪"));
+    status_info.set_xalign(0.0);
+    status_info.set_hexpand(true);
+    status_info.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    status_info.add_css_class("monospace");
+    status_info.add_css_class("owl-status");
+
+    // 行/列 + 已选字数：钉在最右，不 hexpand、不省略。
+    let status_pos = gtk::Label::new(None);
+    status_pos.set_xalign(1.0);
+    status_pos.set_halign(gtk::Align::End);
+    status_pos.set_ellipsize(gtk::pango::EllipsizeMode::None);
+    status_pos.add_css_class("monospace");
+    status_pos.add_css_class("owl-status");
+
+    let status = StatusBar {
+        row: {
+            let b = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+            b.add_css_class("owl-statusbar");
+            b.append(&status_path);
+            b.append(&status_info);
+            b.append(&status_pos);
+            b
+        },
+        path_btn: status_path.clone(),
+        path_label: status_path_label.clone(),
+        info: status_info.clone(),
+        pos: status_pos.clone(),
+    };
+
+    // 路径按钮的弹出菜单：复制完整路径 / 复制文件名 / 打开所在文件夹。
+    // 菜单项在点击时读当前路径，所以「另存为」之后自动跟着变。
+    {
+        let pop = gtk::Popover::new();
+        pop.set_position(gtk::PositionType::Top);
+        pop.set_has_arrow(true);
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        menu.add_css_class("owl-status-menu");
+
+        let item_copy = status_menu_item("复制完整路径");
+        let item_name = status_menu_item("复制文件名");
+        let item_reveal = status_menu_item("打开所在文件夹");
+        menu.append(&item_copy);
+        menu.append(&item_name);
+        menu.append(&item_reveal);
+        pop.set_child(Some(&menu));
+        pop.set_parent(&status_path);
+
+        {
+            let state = state.clone();
+            let pop = pop.clone();
+            item_copy.connect_clicked(move |_| {
+                let text = state.borrow().path.as_ref().map(|p| p.display().to_string());
+                if let Some(t) = text {
+                    if copy_to_clipboard(&t) {
+                        with_state(&state, |s| s.message = "已复制完整路径".to_string());
+                    } else {
+                        with_state(&state, |s| s.message = "复制失败：没有可用的剪贴板".to_string());
+                    }
+                }
+                pop.popdown();
+            });
+        }
+        {
+            let state = state.clone();
+            let pop = pop.clone();
+            item_name.connect_clicked(move |_| {
+                let name = state.borrow().path.as_ref().and_then(|p| {
+                    p.file_name().map(|n| n.to_string_lossy().into_owned())
+                });
+                if let Some(n) = name {
+                    if copy_to_clipboard(&n) {
+                        with_state(&state, |s| s.message = format!("已复制文件名 {n}"));
+                    } else {
+                        with_state(&state, |s| s.message = "复制失败：没有可用的剪贴板".to_string());
+                    }
+                }
+                pop.popdown();
+            });
+        }
+        {
+            let state = state.clone();
+            let pop = pop.clone();
+            item_reveal.connect_clicked(move |_| {
+                let path = state.borrow().path.clone();
+                if let Some(p) = path {
+                    let dir = p.parent().map(|d| d.to_path_buf()).unwrap_or(p.clone());
+                    match open_containing_dir(&dir) {
+                        None => with_state(&state, |s| {
+                            s.message = format!("已打开 {}", dir.display())
+                        }),
+                        Some(err) => with_state(&state, |s| s.message = err),
+                    }
+                }
+                pop.popdown();
+            });
+        }
+        {
+            let pop = pop.clone();
+            status_path.connect_clicked(move |_| {
+                if pop.is_visible() {
+                    pop.popdown();
+                } else {
+                    pop.popup();
+                }
+            });
+        }
+    }
 
     // 编辑区 + 浮层：查找框作为 overlay 子件叠在编辑区之上，
     // 而不是作为兄弟件插进纵向布局去挤压正文。
@@ -343,7 +533,7 @@ pub fn build_tab(env: TabEnv, initial: Option<PathBuf>) -> Rc<Tab> {
 
     let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
     page.append(&editor_layer);
-    page.append(&status);
+    page.append(&status.row);
 
     let title = gtk::Label::new(Some(&display_name_of(&state)));
     title.set_xalign(0.0);
@@ -400,18 +590,16 @@ pub fn build_tab(env: TabEnv, initial: Option<PathBuf>) -> Rc<Tab> {
             hscroll.set_visible(!state.borrow().word_wrap);
             syncing.set(false);
 
-            let status_visible = status.is_visible();
-            let (text, hits, idx, flags) = {
-                let mut s = state.borrow_mut();
-                let t = s.status_text();
+            let status_visible = status.row.is_visible();
+            let (hits, idx, flags) = {
+                let s = state.borrow();
                 (
-                    t,
                     s.hits.len(),
                     s.hit_index,
                     (s.read_only, s.show_line_numbers, s.word_wrap, status_visible),
                 )
             };
-            status.set_label(&text);
+            apply_status(&state, &status);
             find_count.set_label(&if hits == 0 {
                 "—".to_string()
             } else {
@@ -449,8 +637,7 @@ pub fn build_tab(env: TabEnv, initial: Option<PathBuf>) -> Rc<Tab> {
         let status = status.clone();
         Rc::new(move || {
             state.borrow_mut().refresh_view();
-            let text = state.borrow_mut().status_text();
-            status.set_label(&text);
+            apply_status(&state, &status);
             view.queue_draw();
         })
     };
@@ -667,8 +854,8 @@ pub fn build_tab(env: TabEnv, initial: Option<PathBuf>) -> Rc<Tab> {
                     s.set_word_wrap(!s.word_wrap);
                 }),
                 "toggle_status" => {
-                    let vis = status.is_visible();
-                    status.set_visible(!vis);
+                    let vis = status.row.is_visible();
+                    status.row.set_visible(!vis);
                     hook();
                 }
                 "zoom_in" | "zoom_out" | "zoom_reset" => {
@@ -1282,7 +1469,7 @@ fn save_document(state: &Shared) -> Result<(u64, PathBuf), String> {
 // ---------------------------------------------------------------- 后台任务
 
 /// 后台流式建立全文件行索引；UI 全程不阻塞，进度显示在状态栏。
-fn start_index(state: &Shared, hook: &Rc<dyn Fn()>, status: gtk::Label) {
+fn start_index(state: &Shared, hook: &Rc<dyn Fn()>, status: StatusBar) {
     let (mut builder, revision) = {
         let mut s = state.borrow_mut();
         if s.index_building || !s.has_doc() {
@@ -1359,8 +1546,7 @@ fn start_index(state: &Shared, hook: &Rc<dyn Fn()>, status: gtk::Label) {
         // 进度只更新状态栏文字。
         // 绝不调用 hook()/on_change：索引构建在大文件上会持续数秒，40ms 一次的
         // adjustment 回写会不断打断用户正在进行的滚动条拖拽手势。
-        let text = state.borrow_mut().status_text();
-        status.set_label(&text);
+        apply_status(&state, &status);
         glib::ControlFlow::Continue
     });
 }
